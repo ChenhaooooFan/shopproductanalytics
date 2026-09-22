@@ -36,6 +36,21 @@ import streamlit as st
 
 st.set_page_config(page_title="NailVesta 链接深度分析", page_icon="📊", layout="wide")
 
+# st.metric 的数值默认字号固定、不换行，窗口/列一窄就被截断成 "$1...." 这种省略号——
+# 全局改成随列宽自动缩小 + 截不下就换行，保证数字任何时候都完整可见，不再单独调某一处。
+st.markdown("""
+<style>
+div[data-testid="stMetricValue"] {
+    font-size: clamp(0.85rem, 1.7vw, 1.7rem) !important;
+    white-space: normal !important;
+    overflow-wrap: break-word !important;
+    line-height: 1.25 !important;
+}
+div[data-testid="stMetricLabel"] { font-size: 0.8rem !important; white-space: normal !important; }
+div[data-testid="stMetricDelta"] { font-size: 0.75rem !important; white-space: normal !important; }
+</style>
+""", unsafe_allow_html=True)
+
 # ──────────────────────────────────────────────────────────────────────
 # 1. 指标归档：前端 / 后端 分类规则
 # ──────────────────────────────────────────────────────────────────────
@@ -1218,10 +1233,20 @@ if mode == "飞书 Base 直连":
                                 "在 Streamlit Cloud 上部署时留空即可，去 Settings → Secrets 配一次，"
                                 "以后每次打开都会自动生效，不用手填。")
     app_secret = _secret_field(st.sidebar, "App Secret", "LARK_APP_SECRET")
+    def _mask(v: str) -> str:
+        """只给看首尾各4位+长度，够她自己核对是不是复制错/粘了引号/漏删 xxx，不会把 Secret 整个亮出来。"""
+        return f"{v[:4]}…{v[-4:]}（{len(v)}位）" if len(v) > 10 else f"（{len(v)}位，太短了不太对）"
+
     if app_id and app_secret:
-        st.sidebar.caption("🔑 凭证已生效（来自 Secrets 或你刚手填的，长度都对得上），不用重复填。")
+        st.sidebar.caption(f"🔑 App ID: {_mask(app_id)}　App Secret: {_mask(app_secret)}")
+        if "xxx" in app_id.lower() or "xxx" in app_secret.lower():
+            st.sidebar.error("⚠️ 里面还留着占位符 `xxx`——Secrets 里没真的换成你的值。")
+        if app_id.startswith(('"', "'")) or app_secret.startswith(('"', "'")):
+            st.sidebar.error("⚠️ 值开头是引号——粘贴时把 TOML 的 `\"` 也粘进去了，去掉。")
     elif _sec("LARK_APP_ID") or _sec("LARK_APP_SECRET"):
         st.sidebar.caption("⚠️ Secrets 里好像只配了一半（App ID / App Secret 缺一个），检查一下。")
+    else:
+        st.sidebar.caption("还没配 Secrets（两个框都是空的，这不是 bug，去 Settings → Secrets 配一次）。")
     cache_dir = st.sidebar.text_input("本地缓存目录", value=_sec("LARK_CACHE_DIR", DEFAULT_CACHE),
                                       help="已下载的文件会跳过，不会重复下载")
 
