@@ -36,18 +36,77 @@ import streamlit as st
 
 st.set_page_config(page_title="NailVesta 链接深度分析", page_icon="📊", layout="wide")
 
-# st.metric 的数值默认字号固定、不换行，窗口/列一窄就被截断成 "$1...." 这种省略号——
-# 全局改成随列宽自动缩小 + 截不下就换行，保证数字任何时候都完整可见，不再单独调某一处。
+# 全局外观：配色主题在 .streamlit/config.toml 里（primaryColor 等），这里补 config.toml
+# 管不到的细节——数字卡片不截断、按钮/卡片/侧边栏的圆角阴影、字距，让整体更像一个统一设计的产品
+# 而不是默认 Streamlit 模板的感觉。
 st.markdown("""
 <style>
+/* st.metric 数值默认字号固定、不换行，窗口/列一窄就被截断成 "$1...." 这种省略号——
+   改成随列宽自动缩小 + 截不下就换行，任何宽度数字都完整可见。 */
 div[data-testid="stMetricValue"] {
     font-size: clamp(0.85rem, 1.7vw, 1.7rem) !important;
+    font-weight: 650 !important;
     white-space: normal !important;
     overflow-wrap: break-word !important;
     line-height: 1.25 !important;
 }
-div[data-testid="stMetricLabel"] { font-size: 0.8rem !important; white-space: normal !important; }
-div[data-testid="stMetricDelta"] { font-size: 0.75rem !important; white-space: normal !important; }
+div[data-testid="stMetricLabel"] {
+    font-size: 0.78rem !important; white-space: normal !important;
+    color: rgba(236,235,240,0.62) !important; letter-spacing: .02em;
+}
+div[data-testid="stMetricDelta"] { font-size: 0.78rem !important; white-space: normal !important; }
+div[data-testid="stMetric"] {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 12px;
+    padding: 14px 16px 10px;
+}
+
+/* 标题字距收紧一点、字重加粗，看起来更"排版过"而不是浏览器默认 */
+h1 { letter-spacing: -0.01em; font-weight: 750 !important; }
+h2, h3 { letter-spacing: -0.005em; font-weight: 650 !important; }
+
+/* 按钮：圆角、轻微阴影、hover 时上浮一点，比默认方角按钮更精致 */
+.stButton > button, .stDownloadButton > button, .stLinkButton > a {
+    border-radius: 10px !important;
+    transition: transform .12s ease, box-shadow .12s ease, filter .12s ease;
+    font-weight: 550 !important;
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.28);
+    filter: brightness(1.06);
+}
+.stButton > button[kind="primary"] {
+    box-shadow: 0 2px 10px rgba(194,65,107,0.35);
+}
+
+/* 卡片容器（st.container(border=True)，首页快捷入口用的）：更柔和的边框 + hover 轻微高亮 */
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 14px !important;
+    transition: border-color .15s ease, background .15s ease;
+}
+div[data-testid="stVerticalBlockBorderWrapper"]:hover {
+    border-color: rgba(194,65,107,0.45) !important;
+    background: rgba(194,65,107,0.05);
+}
+
+/* 侧边栏导航：选中项字重加粗，整体跟主内容区拉开一点层次 */
+section[data-testid="stSidebar"] {
+    border-right: 1px solid rgba(255,255,255,0.06);
+}
+section[data-testid="stSidebar"] [data-testid="stPageLink"] p { font-weight: 500; }
+
+/* 输入框 / 下拉 / expander：统一圆角，减少默认的生硬直角 */
+div[data-baseweb="select"] > div, div[data-baseweb="input"] > div,
+.stTextInput input, div[data-testid="stExpander"] {
+    border-radius: 10px !important;
+}
+
+/* 表格：轻微圆角收边 */
+div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+    border-radius: 10px; overflow: hidden;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1412,55 +1471,265 @@ if st.session_state.get("_creator_data"):
     st.sidebar.caption("达人组数据：已载入 " +
                        "、".join(f"{n}{len(d):,}行" for n, d in st.session_state["_creator_data"].items()))
 
+# 达人组数据的真实列名（2026-09-21 用真实文件核对过，不是猜的）。
+# 结构跟运营数据完全不同：这里的表头在第 0 行、第 1 行是英文说明（已在读取时跳过）。
+CREATOR_COLS = {
+    "Creators": dict(gmv="Creator-attributed GMV", videos="Videos", live="LIVE streams",
+                     impr="Product impressions", posted=None, orders="Attributed orders",
+                     name="Creator name", creator="Creator name"),
+    "Products": dict(gmv="Creator-attributed GMV", videos="Videos", live="LIVE streams",
+                     impr="Product impressions", posted="Creators posted content",
+                     orders="Attributed orders", name="Product name", creator=None,
+                     with_sales="Creators with sales"),
+    "Videos": dict(gmv="Creator video-attributed GMV", videos=None, live=None,
+                   impr="Video product impressions", posted=None, orders="Video-attributed orders",
+                   name="Video title", creator="Creator name", id_col="Video ID"),
+    "LIVE": dict(gmv="Creator LIVE-attributed GMV", videos=None, live=None,
+                impr="LIVE product impressions", posted=None, orders="LIVE-attributed orders",
+                name="LIVE title", creator="Creator name", id_col="LIVE ID"),
+}
+CREATOR_ORDER = ["Creators", "Products", "Videos", "LIVE"]
+
+
+def _creator_daily(d: pd.DataFrame) -> pd.DataFrame:
+    """只取逐日粒度的行（月度汇总跟逐日混在一张表里，算总量必须先剔掉月度，否则会翻倍）。"""
+    t = d[d["_gran"] == "daily"].copy()
+    t["_d"] = pd.to_datetime(t["_date"])
+    return t
+
+
+def _creator_period_key(t: pd.DataFrame, gran: str) -> pd.Series:
+    if gran == "日":
+        return t["_d"].dt.date
+    if gran == "周":
+        return t["_d"].dt.to_period("W-MON").dt.start_time.dt.date
+    return t["_d"].dt.to_period("M").dt.start_time.dt.date
+
+
+def render_creator_tab():
+    """
+    达人组数据整块内容——独立成函数是因为它完全不依赖运营数据的 df/catalog，
+    这样『只拉了达人组数据、没拉运营数据』时也能单独把这一页显示出来（见下面的入口分支）。
+    """
+    st.subheader("达人组数据：Creators / Products / Videos / LIVE stream")
+    st.caption("独立数据源，跟运营数据是同一个 Lark 租户、不同文档，来自达人组自己维护的表格「达人组数据保存」。"
+              "侧边栏「🎨 达人组数据」拉取；口径：逐日数据（每天各是当天独立数值，不是累计）。")
+    cdata = st.session_state.get("_creator_data")
+    if not cdata:
+        st.info("👈 还没拉取。左侧「🎨 达人组数据」点「🔄 拉取达人组数据」（第一次要下 180+ 个文件，会花点时间；"
+               "之后再拉只下新增的）。")
+    else:
+        span_bits = []
+        for sec in CREATOR_ORDER:
+            if sec in cdata:
+                dd = _creator_daily(cdata[sec])["_d"]
+                if len(dd):
+                    span_bits.append(f"{sec} {dd.min():%m-%d}→{dd.max():%m-%d}")
+        st.success("已载入：" + "　·　".join(f"**{sec}** {len(cdata[sec]):,} 行" for sec in CREATOR_ORDER if sec in cdata))
+        st.caption("覆盖：" + "　".join(span_bits))
+
+        st.markdown("---")
+        st.markdown("### 四个部分总览：GMV / Videos / Product impressions / Creators posted content / 出单达人数")
+        gran0 = st.radio("看哪个粒度", ["日", "周", "月"], horizontal=True, key="cr_gran0", index=2)
+        cc4 = st.columns(4)
+        for cc, sec in zip(cc4, CREATOR_ORDER):
+            with cc:
+                st.markdown(f"**{sec}**")
+                if sec not in cdata:
+                    st.caption("暂无数据")
+                    continue
+                cols = CREATOR_COLS[sec]
+                t = _creator_daily(cdata[sec])
+                st.metric("GMV（合计）", f"${t[cols['gmv']].sum():,.0f}")
+                if cols["videos"]:
+                    st.metric("Videos（合计）", f"{t[cols['videos']].sum():,.0f}")
+                elif cols.get("id_col"):
+                    st.metric("Videos（去重条数）", f"{t[cols['id_col']].nunique():,}")
+                st.metric("Product impressions（合计）", f"{t[cols['impr']].sum():,.0f}")
+                if cols["posted"]:
+                    st.metric("Creators posted content（合计，按产品加总）", f"{t[cols['posted']].sum():,.0f}")
+                else:
+                    st.caption("Creators posted content：这张表没有这个字段（只有 Products 表有）")
+                if cols.get("creator") and cols.get("orders"):
+                    has_o = t[cols["orders"]].fillna(0) > 0
+                    st.metric("出单达人数（去重）", f"{t.loc[has_o, cols['creator']].nunique():,}")
+                elif sec == "Products":
+                    st.caption("出单达人数：Products 表是按产品一行，「Creators with sales」是分产品的，"
+                              "同一达人卖多个产品会被算多次，不能直接加总——总数以 Creators 表为准（见下方）")
+                st.caption(f"GMV 列=`{cols['gmv']}`　出单列=`{cols['orders']}`")
+
+        st.markdown(f"#### {gran0}趋势（GMV，四个部分叠在一起看谁在涨/跌）")
+        trend_frames = []
+        for sec in CREATOR_ORDER:
+            if sec not in cdata:
+                continue
+            t = _creator_daily(cdata[sec])
+            key = _creator_period_key(t, gran0)
+            g = t.groupby(key)[CREATOR_COLS[sec]["gmv"]].sum().reset_index()
+            g.columns = ["期间", "GMV"]
+            g["部分"] = sec
+            trend_frames.append(g)
+        if trend_frames:
+            tf = pd.concat(trend_frames, ignore_index=True)
+            ftr = px.line(tf, x="期间", y="GMV", color="部分", markers=True,
+                         color_discrete_map={"Creators": "#C2416B", "Products": "#4C6EF5",
+                                             "Videos": "#1B3A8C", "LIVE": "#F08C00"})
+            ftr.update_layout(height=320, margin=dict(t=10, b=10), hovermode="x unified")
+            st.plotly_chart(ftr)
+            st.caption("Creators 和 Products 理论上应该几乎相等（都是全量 affiliate GMV 的不同切法）；"
+                      "Videos + LIVE 会略小于它们（差额是商品卡等非内容渠道的达人 GMV）。")
+
+        with st.expander("📋 查看某天/某部分的原始明细"):
+            pc1, pc2 = st.columns(2)
+            sec_pick = pc1.selectbox("部分", [s for s in CREATOR_ORDER if s in cdata], key="cr_prev_sec")
+            dts = sorted(_creator_daily(cdata[sec_pick])["_date"].dropna().unique())
+            date_pick = pc2.selectbox("日期", dts[::-1], key="cr_prev_date") if dts else None
+            if date_pick:
+                dshow = cdata[sec_pick][(cdata[sec_pick]["_date"] == date_pick)
+                                        & (cdata[sec_pick]["_gran"] == "daily")]
+                st.caption(f"{len(dshow)} 行 · 列：" + "、".join(str(c) for c in dshow.columns[4:]))
+                st.dataframe(dshow.drop(columns=["_date", "_gran", "_month", "_src_file"]).head(200),
+                            hide_index=True)
+                st.download_button(f"⬇️ 导出 {sec_pick} {date_pick} CSV",
+                                   dshow.to_csv(index=False).encode("utf-8-sig"),
+                                   f"达人组_{sec_pick}_{date_pick}.csv", "text/csv", key="cr_dl_prev")
+
+        st.markdown("---")
+        st.markdown("### 三个重点追问")
+        st.markdown("**1. Products：LAST CHANCE 的 GMV / 出单数，占每天 / 每周 / 每月总量多少**")
+        if "Products" not in cdata:
+            st.caption("Products 数据还没拉到。")
+        else:
+            cols = CREATOR_COLS["Products"]
+            tp = _creator_daily(cdata["Products"])
+            is_lc = tp[cols["name"]].astype(str).str.upper().str.contains("LAST CHANCE")
+            if not is_lc.any():
+                st.warning(f"「{cols['name']}」这一列里没找到含 'LAST CHANCE' 的行——"
+                          f"看到的产品名比如：{tp[cols['name']].dropna().unique()[:3].tolist()}")
+            else:
+                gran_p = st.radio("粒度", ["日", "周", "月"], horizontal=True, key="cr_p_gran", index=2)
+                key = _creator_period_key(tp, gran_p)
+                agc = tp.groupby(key).agg(tot_gmv=(cols["gmv"], "sum"), tot_ord=(cols["orders"], "sum"))
+                lcc = tp[is_lc].groupby(key[is_lc]).agg(lc_gmv=(cols["gmv"], "sum"), lc_ord=(cols["orders"], "sum"))
+                shp = agc.join(lcc, how="left").fillna(0)
+                shp["GMV占比%"] = np.where(shp["tot_gmv"] > 0, shp["lc_gmv"] / shp["tot_gmv"] * 100, np.nan)
+                shp["出单数占比%"] = np.where(shp["tot_ord"] > 0, shp["lc_ord"] / shp["tot_ord"] * 100, np.nan)
+                fp = go.Figure()
+                fp.add_bar(x=shp.index.astype(str), y=shp["GMV占比%"], name="GMV占比%", marker_color="#C2416B")
+                fp.add_trace(go.Scatter(x=shp.index.astype(str), y=shp["出单数占比%"], name="出单数占比%",
+                                        mode="lines+markers", line=dict(color="#4C6EF5", width=2), yaxis="y2"))
+                fp.update_layout(height=300, margin=dict(t=30, b=10), hovermode="x unified",
+                                 yaxis=dict(title="GMV占比%"), yaxis2=dict(title="出单数占比%", overlaying="y", side="right"),
+                                 title=f"LAST CHANCE 占全部 Products {gran_p}GMV / 出单数 的比例")
+                st.plotly_chart(fp)
+                disp = shp.reset_index().rename(columns={shp.index.name or "index": gran_p})
+                for c in ["tot_gmv", "lc_gmv"]:
+                    disp[c] = disp[c].map(lambda v: f"${v:,.0f}")
+                for c in ["GMV占比%", "出单数占比%"]:
+                    disp[c] = disp[c].map(lambda v: "—" if pd.isna(v) else f"{v:.1f}%")
+                st.dataframe(disp.rename(columns={"tot_gmv": "全部Products GMV", "lc_gmv": "LAST CHANCE GMV",
+                                                  "tot_ord": "全部Products出单数", "lc_ord": "LAST CHANCE出单数"}),
+                            hide_index=True)
+
+        st.markdown("**2. Creators：多少达人出单了**")
+        if "Creators" not in cdata:
+            st.caption("Creators 数据还没拉到。")
+        else:
+            cols = CREATOR_COLS["Creators"]
+            tc = _creator_daily(cdata["Creators"])
+            gran_c = st.radio("粒度 ", ["日", "周", "月"], horizontal=True, key="cr_c_gran", index=2)
+            key = _creator_period_key(tc, gran_c)
+            tc = tc.assign(_period=key)
+            g = tc.groupby("_period").apply(
+                lambda x: pd.Series({"表里出现的达人数": x[cols["name"]].nunique(),
+                                     "出单达人数": x.loc[x[cols["orders"]].fillna(0) > 0, cols["name"]].nunique()}),
+                include_groups=False).reset_index()
+            g["出单达人占比%"] = (g["出单达人数"] / g["表里出现的达人数"] * 100).round(1)
+            m1, m2, m3 = st.columns(3)
+            last = g.iloc[-1] if len(g) else None
+            if last is not None:
+                m1.metric(f"最近一{gran_c}·出单达人数", f"{int(last['出单达人数']):,}")
+                m2.metric(f"最近一{gran_c}·表里总达人数", f"{int(last['表里出现的达人数']):,}")
+                m3.metric("出单占比", f"{last['出单达人占比%']:.0f}%")
+            fcg = go.Figure(go.Bar(x=g["_period"].astype(str), y=g["出单达人数"], marker_color="#C2416B"))
+            fcg.update_layout(height=260, margin=dict(t=30, b=10), title=f"每{gran_c}出单达人数")
+            st.plotly_chart(fcg)
+            st.dataframe(g.rename(columns={"_period": gran_c}), hide_index=True)
+
+        st.markdown("**3. Videos：当月有多少视频出单了、出单 GMV 多少**")
+        if "Videos" not in cdata:
+            st.caption("Videos 数据还没拉到。")
+        else:
+            cols = CREATOR_COLS["Videos"]
+            tv = _creator_daily(cdata["Videos"])
+            months = sorted(tv["_d"].dt.to_period("M").dropna().unique().astype(str))
+            if not months:
+                st.caption("日期解析不出有效月份。")
+            else:
+                mpick = st.selectbox("选月份 ", months, index=len(months) - 1, key="cr_v_month")
+                mm = tv[tv["_d"].dt.to_period("M").astype(str) == mpick]
+                has_o = mm[cols["orders"]].fillna(0) > 0
+                n_v_all = mm[cols["id_col"]].nunique()
+                n_v = mm.loc[has_o, cols["id_col"]].nunique()
+                g_v = mm.loc[has_o, cols["gmv"]].sum()
+                v1, v2, v3 = st.columns(3)
+                v1.metric(f"{mpick} 出单视频数", f"{n_v:,}", f"／{n_v_all:,} 条出现过的视频")
+                v2.metric(f"{mpick} 出单视频 GMV", f"${g_v:,.0f}")
+                v3.metric(f"{mpick} 视频出单转化", f"{n_v/n_v_all*100:.0f}%" if n_v_all else "—",
+                         help="出单视频数 ÷ 当月出现过的视频总数（同一视频可能出现在多天的文件里，已按 Video ID 去重）")
+                top_v = (mm[has_o].groupby([cols["id_col"], cols["name"]])[cols["gmv"]].sum()
+                        .reset_index().sort_values(cols["gmv"], ascending=False).head(15))
+                top_v[cols["gmv"]] = top_v[cols["gmv"]].map(lambda v: f"${v:,.0f}")
+                st.markdown(f"**{mpick} 出单最多的视频（Top 15）**")
+                st.dataframe(top_v.rename(columns={cols["name"]: "标题", cols["gmv"]: "当月GMV"}), hide_index=True)
+
 payloads = st.session_state.get("_payloads", [])
-if not payloads:
+has_creator = bool(st.session_state.get("_creator_data"))
+df = catalog = pd.DataFrame()
+log: list[str] = []
+
+if payloads:
+    df, catalog, log = load_files(payloads)
+    if df.empty:
+        st.title("NailVesta 链接数据深度分析")
+        st.error("没有解析到有效数据。请检查文件格式。")
+        with st.expander("解析日志"):
+            st.write("\n".join(log))
+        st.stop()
+
+has_ops = not df.empty
+
+if has_ops:
+    dmin, dmax = df["日期"].min(), df["日期"].max()
+    st.sidebar.success(f"已载入 {df['日期'].nunique()} 天 · {df['product_id'].nunique()} 个链接")
+    st.sidebar.caption(f"{dmin.date()} → {dmax.date()}")
+
+    df_all = df          # 「两段对比」用全量数据，不受下面的分析区间限制
+    rng = st.sidebar.date_input("分析区间", value=(dmin.date(), dmax.date()),
+                                min_value=dmin.date(), max_value=dmax.date())
+    if isinstance(rng, tuple) and len(rng) == 2:
+        df = df[(df["日期"] >= pd.Timestamp(rng[0])) & (df["日期"] <= pd.Timestamp(rng[1]))]
+
+    with st.sidebar.expander("解析日志"):
+        st.text("\n".join(log[-200:]))
+
+    # 缺口检查
+    alldays = pd.date_range(df["日期"].min(), df["日期"].max(), freq="D")
+    missing = sorted(set(alldays := set(alldays)) - set(df["日期"].unique()))
+    if missing:
+        st.sidebar.warning(f"缺 {len(missing)} 天，如：{', '.join(str(pd.Timestamp(m).date()) for m in list(missing)[:5])}…")
+
+    daily = aggregate(df, "日")
+    EV_ALL = detect_events(df)          # 改动事件：链接下钻 和 改动溯源 共用，只算一次
+
+if not has_ops and not has_creator:
     st.title("NailVesta 链接数据深度分析")
-    st.info("👈 左侧选择数据源载入每日 product analysis 导出文件（3/20–9/20 每天一个 xlsx）。")
+    st.info("👈 左侧选择数据源：载入每日 product analysis 导出文件（3/20–9/20 每天一个 xlsx），"
+           "或者只拉「🎨 达人组数据」也可以单独看那一块。")
     st.markdown(
         "**说明**：飞书 Base 里的日报是*附件文件*。把它们下载到一个文件夹（或打包成 zip），"
         "在左侧指定路径/上传即可。程序会自动识别每个文件内部的 `Analysis date`。")
     st.stop()
-
-df, catalog, log = load_files(payloads)
-if df.empty:
-    st.error("没有解析到有效数据。请检查文件格式。")
-    with st.expander("解析日志"):
-        st.write("\n".join(log))
-    st.stop()
-
-dmin, dmax = df["日期"].min(), df["日期"].max()
-st.sidebar.success(f"已载入 {df['日期'].nunique()} 天 · {df['product_id'].nunique()} 个链接")
-st.sidebar.caption(f"{dmin.date()} → {dmax.date()}")
-
-df_all = df          # 「两段对比」用全量数据，不受下面的分析区间限制
-rng = st.sidebar.date_input("分析区间", value=(dmin.date(), dmax.date()),
-                            min_value=dmin.date(), max_value=dmax.date())
-if isinstance(rng, tuple) and len(rng) == 2:
-    df = df[(df["日期"] >= pd.Timestamp(rng[0])) & (df["日期"] <= pd.Timestamp(rng[1]))]
-
-with st.sidebar.expander("解析日志"):
-    st.text("\n".join(log[-200:]))
-
-# 缺口检查
-alldays = pd.date_range(df["日期"].min(), df["日期"].max(), freq="D")
-missing = sorted(set(alldays := set(alldays)) - set(df["日期"].unique()))
-if missing:
-    st.sidebar.warning(f"缺 {len(missing)} 天，如：{', '.join(str(pd.Timestamp(m).date()) for m in list(missing)[:5])}…")
-
-# ──────────────────────────────────────────────────────────────────────
-# 6. 页面
-# ──────────────────────────────────────────────────────────────────────
-st.title("NailVesta 链接数据深度分析")
-st.caption(f"{df['日期'].min().date()} → {df['日期'].max().date()}　·　"
-           f"{df['日期'].nunique()} 天　·　{df['product_id'].nunique()} 个链接　·　{len(catalog)} 个指标")
-
-(T_OVER, T_CMP, T_GRAN, T_FRONT, T_BACK, T_ANOM, T_LINK, T_CAT, T_CHAIN, T_EFF, T_CREATOR) = st.tabs([
-    "① 总览", "② 两段对比·归因", "③ 多粒度对比", "④ 前端指标", "⑤ 后端指标",
-    "⑥ 异常检测与归因", "⑦ 链接下钻", "⑧ 指标归档", "⑨ 日环比链条 & 回暖", "⑩ 改动效果溯源",
-    "⑪ 达人组数据"])
-
-daily = aggregate(df, "日")
-EV_ALL = detect_events(df)          # 改动事件：⑦ 下钻和 ⑩ 溯源共用，只算一次
 
 
 def sums_of(d: pd.DataFrame) -> dict:
@@ -1519,26 +1788,71 @@ SCORE = [
 ]
 
 # ── ① 总览 ────────────────────────────────────────────────────────────
-with T_OVER:
+def _nav_cards(items: list[tuple[str, str, str]]):
+    """首页快捷入口卡片：items = [(page_key, 一句话说明, emoji)]"""
+    cols = st.columns(len(items))
+    for cc, (key, desc, emoji) in zip(cols, items):
+        p = PAGE_REFS.get(key)
+        if not p:
+            continue
+        with cc.container(border=True):
+            st.page_link(p, label=f"**{p.title}**", icon=emoji)
+            st.caption(desc)
+
+
+def page_overview():
+    st.title("NailVesta 链接数据深度分析")
+    st.caption(f"运营数据 {df_all['日期'].min().date()} → {df_all['日期'].max().date()}　·　"
+              f"{df_all['日期'].nunique()} 天　·　{df_all['product_id'].nunique()} 个链接　·　"
+              f"{len(catalog)} 个指标" + ("　·　达人组数据已接入" if has_creator else ""))
+
     tot = {k: col(df, k).sum() for k in K}
+    st.markdown("#### 核心指标（当前分析区间累计）")
     c1, c2 = st.columns(2)
     with c1:
-        st.subheader("后端 · 成交")
+        st.markdown("**后端 · 成交**")
         a, b, c, d2 = st.columns(4)
         a.metric("GMV", f"${tot['gmv']/1e6:,.2f}M" if tot["gmv"] >= 1e6 else f"${tot['gmv']:,.0f}")
         b.metric("订单", f"{tot['orders']:,.0f}")
         c.metric("件数", f"{tot['items']:,.0f}")
         d2.metric("AOV", f"${tot['gmv']/tot['sku']:,.2f}" if tot["sku"] else "—")
     with c2:
-        st.subheader("前端 · 流量")
+        st.markdown("**前端 · 流量**")
         a, b, c, d2 = st.columns(4)
         a.metric("曝光", f"{tot['impr']/1e6:,.1f}M" if tot["impr"] >= 1e6 else f"{tot['impr']:,.0f}")
         b.metric("点击", f"{tot['clicks']/1e6:,.2f}M" if tot["clicks"] >= 1e6 else f"{tot['clicks']:,.0f}")
         c.metric("CTR", f"{tot['clicks']/tot['impr']*100:.2f}%" if tot["impr"] else "—")
         d2.metric("CTOR", f"{tot['sku']/tot['clicks']*100:.2f}%" if tot["clicks"] else "—")
 
+    # 最近一周 vs 上周：一句话headline，不用跳去②就知道大盘怎么样
+    D = df_all
+    d_last = D["日期"].max()
+    a0, a1 = d_last - pd.Timedelta(days=6), d_last
+    b0, b1 = d_last - pd.Timedelta(days=13), d_last - pd.Timedelta(days=7)
+    cm, bm = D["日期"].between(a0, a1), D["日期"].between(b0, b1)
+    if D.loc[cm, "日期"].nunique() and D.loc[bm, "日期"].nunique():
+        sc, sb = sums_of(D[cm]), sums_of(D[bm])
+        g_now, g_prev = sc["gmv"], sb["gmv"]
+        i_now, i_prev = sc["impr"], sb["impr"]
+        tg = sum_contrib(*link_sums(D, cm, bm, 1.0)[:2], link_sums(D, cm, bm, 1.0)[2], "gmv")
+        top = tg[tg["Δ"] < 0].head(1) if g_now < g_prev else tg[tg["Δ"] > 0].tail(1)
+        who = f"，主要是 **{top.iloc[0]['链接']}**（{usd(top.iloc[0]['Δ'])}）" if len(top) else ""
+        arrow = "📈" if g_now >= g_prev else "📉"
+        st.info(md(f"{arrow} **最近 7 天**（{a0:%m/%d}–{a1:%m/%d}）GMV {usd(g_now, sign=False)}"
+                  f"（{chg_txt(g_now, g_prev, 'money')} vs 前 7 天），曝光 {i_now:,.0f}"
+                  f"（{chg_txt(i_now, i_prev, 'count')}）{who}。想看完整归因，点下面「两段对比·归因」。"))
+
     st.markdown("---")
-    st.subheader("GMV 与曝光（双轴指数化，4 项归一到起点=100）")
+    st.markdown("#### 快捷入口")
+    _nav_cards([("compare", "谁涨谁跌、掉在哪个渠道，默认最近7天 vs 前7天", "🔍"),
+               ("anomaly", "自动揪出突增突降的日子，点名主责链接", "🚨"),
+               ("chain", "大跌之后有没有回暖，逐日追踪", "📉"),
+               ("effect", "你改过的链接，改完有没有用", "🧪")])
+    if has_creator:
+        _nav_cards([("creator", "Creators / Products / Videos / LIVE，达人组自己的数据源", "🎨")])
+
+    st.markdown("---")
+    st.markdown("#### GMV 与曝光（双轴指数化，4 项归一到起点=100）")
     idx = daily.copy()
     for nm, kk in [("GMV", K["gmv"]), ("曝光", K["impr"])]:
         if kk in idx:
@@ -1555,14 +1869,15 @@ with T_OVER:
         fig.update_layout(height=380, legend_title="", hovermode="x unified")
         st.plotly_chart(fig)
 
-    st.subheader("渠道 GMV 结构（每日堆叠）")
+    st.markdown("#### 渠道 GMV 结构（每日堆叠）")
     ch = df.copy()
     ch_d = ch.groupby("日期").agg(**{lbl: (K[k], "sum") for lbl, k in CHANNELS}).reset_index()
-    figc = px.area(ch_d, x="日期", y=[l for l, _ in CHANNELS], labels={"value": "GMV", "日期": ""})
+    figc = px.area(ch_d, x="日期", y=[l for l, _ in CHANNELS], labels={"value": "GMV", "日期": ""},
+                   color_discrete_map=CH_COLOR)
     figc.update_layout(height=360, legend_title="", hovermode="x unified")
     st.plotly_chart(figc)
 
-# ── ② 两段对比·归因 ────────────────────────────────────────────────────
+# ── 两段对比·归因 ──────────────────────────────────────────────────────
 def render_compare():
     st.subheader("两段时间对比：谁导致的、掉在哪个渠道、卡在哪一环")
     st.caption("默认 = 数据里最近 7 天 vs 再往前 7 天（这一页不受左侧『分析区间』限制）。"
@@ -1850,11 +2165,11 @@ def render_compare():
         st.caption(f"本期没有哪一天偏离前 7 日均 ≥ {thr}%。")
 
 
-with T_CMP:
+def page_compare():
     render_compare()
 
 # ── ③ 多粒度对比 ──────────────────────────────────────────────────────
-with T_GRAN:
+def page_granular():
     st.subheader("日 / 周 / 月 / 季 —— 环比对比")
     gran = st.radio("粒度", list(PERIODS.keys()), horizontal=True, index=1)
     agg = aggregate(df, gran)
@@ -2003,16 +2318,16 @@ def section_view(kind: str, gran_key: str):
     st.caption(f"该分类共 {len(cat)} 个字段（见「⑧ 指标归档」）")
 
 
-with T_FRONT:
+def page_frontend():
     st.markdown("**前端 = 流量获取与漏斗效率**：曝光 / 点击 / CTR / 加购 / CTOR / 内容供给")
     section_view("前端", "front")
 
-with T_BACK:
+def page_backend():
     st.markdown("**后端 = 成交与履约售后**：GMV / 订单 / 件数 / 客户 / AOV / 退款 / 运费 / 税")
     section_view("后端", "back")
 
 # ── ⑥ 异常检测与归因 ──────────────────────────────────────────────────
-with T_ANOM:
+def page_anomaly():
     st.subheader("异常检测与自动归因")
     st.caption("维度自选：**日 / 周 / 月**。每检出一次突增/突降，自动告诉你 **是哪几条链在动、掉在哪个渠道、为什么**。"
                "基线只用过去（前 N 期），不偷看未来；每个百分比都写明了跟谁比。周 / 月的规模指标按日均比。")
@@ -2179,7 +2494,7 @@ with T_ANOM:
             st.info(md(" ".join(bits)))
 
 # ── ⑦ 链接下钻 ────────────────────────────────────────────────────────
-with T_LINK:
+def page_drilldown():
     st.subheader("单链接全指标下钻")
     tot_by = df.groupby(["product_id"]).agg(g=(K["gmv"], "sum"), n=("product_name", "last")).reset_index()
     tot_by = tot_by.sort_values("g", ascending=False)
@@ -2249,7 +2564,7 @@ with T_LINK:
     st.dataframe(round_num(tshow.iloc[::-1]), hide_index=True)
 
 # ── ⑧ 指标归档 ────────────────────────────────────────────────────────
-with T_CAT:
+def page_catalog():
     st.subheader("全指标归档（前端 / 后端）")
     if catalog.empty:
         st.warning("未生成指标目录。")
@@ -2300,7 +2615,7 @@ def link_selector(key: str, allow_all=True):
 
 
 # ── ⑨ 日环比链条 & 回暖 ───────────────────────────────────────────────
-with T_CHAIN:
+def page_chain():
     st.subheader("逐日环比链条：每一天相对前一天怎么动的")
     st.caption("解决「下降 7% 是跟什么比的 7%」—— 这里每个百分比都明确标注了基准。")
     c1, c2, c3 = st.columns([2, 1, 1])
@@ -2443,7 +2758,7 @@ with T_CHAIN:
                 st.dataframe(show[["D+N", "日期", "值", "vs 前一天", "vs 跌前7日中位数"]], hide_index=True)
 
 # ── ⑩ 改动效果溯源 ────────────────────────────────────────────────────
-with T_EFF:
+def page_effect():
     st.subheader("你改过的链接，改完到底有没有用")
     st.caption("事件来源：① 从数据自动识别（改名/重组、件单价突变 = 改价/改促销、上架、断更恢复）；"
                "② 你手工登记的改动。口径：改后 7 天日均 vs 改前 7 天日均（另附改后 14 天）。")
@@ -2598,216 +2913,43 @@ with T_EFF:
             st.info(f"**{win_n}/{len(rd)}** 个改动事件在改后 7 天 GMV 是上涨的"
                     f"（口径：改后 7 日均 vs 改前 7 日均；只看成交是否变多，不代表利润）。")
 
-# ── ⑪ 达人组数据 ──────────────────────────────────────────────────────
-# 达人组数据的真实列名（2026-09-21 用真实文件核对过，不是猜的）。
-# 结构跟运营数据完全不同：这里的表头在第 0 行、第 1 行是英文说明（已在读取时跳过）。
-CREATOR_COLS = {
-    "Creators": dict(gmv="Creator-attributed GMV", videos="Videos", live="LIVE streams",
-                     impr="Product impressions", posted=None, orders="Attributed orders",
-                     name="Creator name", creator="Creator name"),
-    "Products": dict(gmv="Creator-attributed GMV", videos="Videos", live="LIVE streams",
-                     impr="Product impressions", posted="Creators posted content",
-                     orders="Attributed orders", name="Product name", creator=None,
-                     with_sales="Creators with sales"),
-    "Videos": dict(gmv="Creator video-attributed GMV", videos=None, live=None,
-                   impr="Video product impressions", posted=None, orders="Video-attributed orders",
-                   name="Video title", creator="Creator name", id_col="Video ID"),
-    "LIVE": dict(gmv="Creator LIVE-attributed GMV", videos=None, live=None,
-                impr="LIVE product impressions", posted=None, orders="LIVE-attributed orders",
-                name="LIVE title", creator="Creator name", id_col="LIVE ID"),
-}
-CREATOR_ORDER = ["Creators", "Products", "Videos", "LIVE"]
+# ──────────────────────────────────────────────────────────────────────
+# 7. 页面导航——真正的多页应用（st.navigation），不是横排 tab：
+#    每次切换都是整页刷新，滚动位置自动回到顶部，不用再上下滑着找。
+# ──────────────────────────────────────────────────────────────────────
+PAGE_REFS: dict[str, "st.navigation.StreamlitPage"] = {}
 
 
-def _creator_daily(d: pd.DataFrame) -> pd.DataFrame:
-    """只取逐日粒度的行（月度汇总跟逐日混在一张表里，算总量必须先剔掉月度，否则会翻倍）。"""
-    t = d[d["_gran"] == "daily"].copy()
-    t["_d"] = pd.to_datetime(t["_date"])
-    return t
+def _reg(key: str, func, title: str, icon: str):
+    p = st.Page(func, title=title, icon=icon, url_path=key)
+    PAGE_REFS[key] = p
+    return p
 
 
-def _creator_period_key(t: pd.DataFrame, gran: str) -> pd.Series:
-    if gran == "日":
-        return t["_d"].dt.date
-    if gran == "周":
-        return t["_d"].dt.to_period("W-MON").dt.start_time.dt.date
-    return t["_d"].dt.to_period("M").dt.start_time.dt.date
+nav_sections: dict[str, list] = {}
+if has_ops:
+    nav_sections["总览"] = [_reg("overview", page_overview, "总览", "🏠")]
+    nav_sections["深度分析"] = [
+        _reg("compare", page_compare, "两段对比 · 归因", "🔍"),
+        _reg("granular", page_granular, "多粒度对比", "🗓️"),
+        _reg("frontend", page_frontend, "前端指标", "📈"),
+        _reg("backend", page_backend, "后端指标", "💰"),
+    ]
+    nav_sections["监控与溯源"] = [
+        _reg("anomaly", page_anomaly, "异常检测与归因", "🚨"),
+        _reg("drilldown", page_drilldown, "链接下钻", "🔗"),
+        _reg("chain", page_chain, "日环比链条 & 回暖", "📉"),
+        _reg("effect", page_effect, "改动效果溯源", "🧪"),
+    ]
+    nav_sections["参考"] = [_reg("catalog", page_catalog, "指标归档", "📚")]
+if has_creator:
+    nav_sections["达人组"] = [_reg("creator", render_creator_tab, "达人组数据", "🎨")]
 
+pg = st.navigation(nav_sections, position="sidebar", expanded=True)
+pg.run()
 
-with T_CREATOR:
-    st.subheader("达人组数据：Creators / Products / Videos / LIVE stream")
-    st.caption("独立数据源，跟运营数据是同一个 Lark 租户、不同文档，来自达人组自己维护的表格「达人组数据保存」。"
-              "侧边栏「🎨 达人组数据」拉取；口径：逐日数据（每天各是当天独立数值，不是累计）。")
-    cdata = st.session_state.get("_creator_data")
-    if not cdata:
-        st.info("👈 还没拉取。左侧「🎨 达人组数据」点「🔄 拉取达人组数据」（第一次要下 180+ 个文件，会花点时间；"
-               "之后再拉只下新增的）。")
-    else:
-        span_bits = []
-        for sec in CREATOR_ORDER:
-            if sec in cdata:
-                dd = _creator_daily(cdata[sec])["_d"]
-                if len(dd):
-                    span_bits.append(f"{sec} {dd.min():%m-%d}→{dd.max():%m-%d}")
-        st.success("已载入：" + "　·　".join(f"**{sec}** {len(cdata[sec]):,} 行" for sec in CREATOR_ORDER if sec in cdata))
-        st.caption("覆盖：" + "　".join(span_bits))
-
-        st.markdown("---")
-        st.markdown("### 四个部分总览：GMV / Videos / Product impressions / Creators posted content / 出单达人数")
-        gran0 = st.radio("看哪个粒度", ["日", "周", "月"], horizontal=True, key="cr_gran0", index=2)
-        cc4 = st.columns(4)
-        for cc, sec in zip(cc4, CREATOR_ORDER):
-            with cc:
-                st.markdown(f"**{sec}**")
-                if sec not in cdata:
-                    st.caption("暂无数据")
-                    continue
-                cols = CREATOR_COLS[sec]
-                t = _creator_daily(cdata[sec])
-                st.metric("GMV（合计）", f"${t[cols['gmv']].sum():,.0f}")
-                if cols["videos"]:
-                    st.metric("Videos（合计）", f"{t[cols['videos']].sum():,.0f}")
-                elif cols.get("id_col"):
-                    st.metric("Videos（去重条数）", f"{t[cols['id_col']].nunique():,}")
-                st.metric("Product impressions（合计）", f"{t[cols['impr']].sum():,.0f}")
-                if cols["posted"]:
-                    st.metric("Creators posted content（合计，按产品加总）", f"{t[cols['posted']].sum():,.0f}")
-                else:
-                    st.caption("Creators posted content：这张表没有这个字段（只有 Products 表有）")
-                if cols.get("creator") and cols.get("orders"):
-                    has_o = t[cols["orders"]].fillna(0) > 0
-                    st.metric("出单达人数（去重）", f"{t.loc[has_o, cols['creator']].nunique():,}")
-                elif sec == "Products":
-                    st.caption("出单达人数：Products 表是按产品一行，「Creators with sales」是分产品的，"
-                              "同一达人卖多个产品会被算多次，不能直接加总——总数以 Creators 表为准（见下方）")
-                st.caption(f"GMV 列=`{cols['gmv']}`　出单列=`{cols['orders']}`")
-
-        st.markdown(f"#### {gran0}趋势（GMV，四个部分叠在一起看谁在涨/跌）")
-        trend_frames = []
-        for sec in CREATOR_ORDER:
-            if sec not in cdata:
-                continue
-            t = _creator_daily(cdata[sec])
-            key = _creator_period_key(t, gran0)
-            g = t.groupby(key)[CREATOR_COLS[sec]["gmv"]].sum().reset_index()
-            g.columns = ["期间", "GMV"]
-            g["部分"] = sec
-            trend_frames.append(g)
-        if trend_frames:
-            tf = pd.concat(trend_frames, ignore_index=True)
-            ftr = px.line(tf, x="期间", y="GMV", color="部分", markers=True,
-                         color_discrete_map={"Creators": "#C2416B", "Products": "#4C6EF5",
-                                             "Videos": "#1B3A8C", "LIVE": "#F08C00"})
-            ftr.update_layout(height=320, margin=dict(t=10, b=10), hovermode="x unified")
-            st.plotly_chart(ftr)
-            st.caption("Creators 和 Products 理论上应该几乎相等（都是全量 affiliate GMV 的不同切法）；"
-                      "Videos + LIVE 会略小于它们（差额是商品卡等非内容渠道的达人 GMV）。")
-
-        with st.expander("📋 查看某天/某部分的原始明细"):
-            pc1, pc2 = st.columns(2)
-            sec_pick = pc1.selectbox("部分", [s for s in CREATOR_ORDER if s in cdata], key="cr_prev_sec")
-            dts = sorted(_creator_daily(cdata[sec_pick])["_date"].dropna().unique())
-            date_pick = pc2.selectbox("日期", dts[::-1], key="cr_prev_date") if dts else None
-            if date_pick:
-                dshow = cdata[sec_pick][(cdata[sec_pick]["_date"] == date_pick)
-                                        & (cdata[sec_pick]["_gran"] == "daily")]
-                st.caption(f"{len(dshow)} 行 · 列：" + "、".join(str(c) for c in dshow.columns[4:]))
-                st.dataframe(dshow.drop(columns=["_date", "_gran", "_month", "_src_file"]).head(200),
-                            hide_index=True)
-                st.download_button(f"⬇️ 导出 {sec_pick} {date_pick} CSV",
-                                   dshow.to_csv(index=False).encode("utf-8-sig"),
-                                   f"达人组_{sec_pick}_{date_pick}.csv", "text/csv", key="cr_dl_prev")
-
-        st.markdown("---")
-        st.markdown("### 三个重点追问")
-        st.markdown("**1. Products：LAST CHANCE 的 GMV / 出单数，占每天 / 每周 / 每月总量多少**")
-        if "Products" not in cdata:
-            st.caption("Products 数据还没拉到。")
-        else:
-            cols = CREATOR_COLS["Products"]
-            tp = _creator_daily(cdata["Products"])
-            is_lc = tp[cols["name"]].astype(str).str.upper().str.contains("LAST CHANCE")
-            if not is_lc.any():
-                st.warning(f"「{cols['name']}」这一列里没找到含 'LAST CHANCE' 的行——"
-                          f"看到的产品名比如：{tp[cols['name']].dropna().unique()[:3].tolist()}")
-            else:
-                gran_p = st.radio("粒度", ["日", "周", "月"], horizontal=True, key="cr_p_gran", index=2)
-                key = _creator_period_key(tp, gran_p)
-                agc = tp.groupby(key).agg(tot_gmv=(cols["gmv"], "sum"), tot_ord=(cols["orders"], "sum"))
-                lcc = tp[is_lc].groupby(key[is_lc]).agg(lc_gmv=(cols["gmv"], "sum"), lc_ord=(cols["orders"], "sum"))
-                shp = agc.join(lcc, how="left").fillna(0)
-                shp["GMV占比%"] = np.where(shp["tot_gmv"] > 0, shp["lc_gmv"] / shp["tot_gmv"] * 100, np.nan)
-                shp["出单数占比%"] = np.where(shp["tot_ord"] > 0, shp["lc_ord"] / shp["tot_ord"] * 100, np.nan)
-                fp = go.Figure()
-                fp.add_bar(x=shp.index.astype(str), y=shp["GMV占比%"], name="GMV占比%", marker_color="#C2416B")
-                fp.add_trace(go.Scatter(x=shp.index.astype(str), y=shp["出单数占比%"], name="出单数占比%",
-                                        mode="lines+markers", line=dict(color="#4C6EF5", width=2), yaxis="y2"))
-                fp.update_layout(height=300, margin=dict(t=30, b=10), hovermode="x unified",
-                                 yaxis=dict(title="GMV占比%"), yaxis2=dict(title="出单数占比%", overlaying="y", side="right"),
-                                 title=f"LAST CHANCE 占全部 Products {gran_p}GMV / 出单数 的比例")
-                st.plotly_chart(fp)
-                disp = shp.reset_index().rename(columns={shp.index.name or "index": gran_p})
-                for c in ["tot_gmv", "lc_gmv"]:
-                    disp[c] = disp[c].map(lambda v: f"${v:,.0f}")
-                for c in ["GMV占比%", "出单数占比%"]:
-                    disp[c] = disp[c].map(lambda v: "—" if pd.isna(v) else f"{v:.1f}%")
-                st.dataframe(disp.rename(columns={"tot_gmv": "全部Products GMV", "lc_gmv": "LAST CHANCE GMV",
-                                                  "tot_ord": "全部Products出单数", "lc_ord": "LAST CHANCE出单数"}),
-                            hide_index=True)
-
-        st.markdown("**2. Creators：多少达人出单了**")
-        if "Creators" not in cdata:
-            st.caption("Creators 数据还没拉到。")
-        else:
-            cols = CREATOR_COLS["Creators"]
-            tc = _creator_daily(cdata["Creators"])
-            gran_c = st.radio("粒度 ", ["日", "周", "月"], horizontal=True, key="cr_c_gran", index=2)
-            key = _creator_period_key(tc, gran_c)
-            tc = tc.assign(_period=key)
-            g = tc.groupby("_period").apply(
-                lambda x: pd.Series({"表里出现的达人数": x[cols["name"]].nunique(),
-                                     "出单达人数": x.loc[x[cols["orders"]].fillna(0) > 0, cols["name"]].nunique()}),
-                include_groups=False).reset_index()
-            g["出单达人占比%"] = (g["出单达人数"] / g["表里出现的达人数"] * 100).round(1)
-            m1, m2, m3 = st.columns(3)
-            last = g.iloc[-1] if len(g) else None
-            if last is not None:
-                m1.metric(f"最近一{gran_c}·出单达人数", f"{int(last['出单达人数']):,}")
-                m2.metric(f"最近一{gran_c}·表里总达人数", f"{int(last['表里出现的达人数']):,}")
-                m3.metric("出单占比", f"{last['出单达人占比%']:.0f}%")
-            fcg = go.Figure(go.Bar(x=g["_period"].astype(str), y=g["出单达人数"], marker_color="#C2416B"))
-            fcg.update_layout(height=260, margin=dict(t=30, b=10), title=f"每{gran_c}出单达人数")
-            st.plotly_chart(fcg)
-            st.dataframe(g.rename(columns={"_period": gran_c}), hide_index=True)
-
-        st.markdown("**3. Videos：当月有多少视频出单了、出单 GMV 多少**")
-        if "Videos" not in cdata:
-            st.caption("Videos 数据还没拉到。")
-        else:
-            cols = CREATOR_COLS["Videos"]
-            tv = _creator_daily(cdata["Videos"])
-            months = sorted(tv["_d"].dt.to_period("M").dropna().unique().astype(str))
-            if not months:
-                st.caption("日期解析不出有效月份。")
-            else:
-                mpick = st.selectbox("选月份 ", months, index=len(months) - 1, key="cr_v_month")
-                mm = tv[tv["_d"].dt.to_period("M").astype(str) == mpick]
-                has_o = mm[cols["orders"]].fillna(0) > 0
-                n_v_all = mm[cols["id_col"]].nunique()
-                n_v = mm.loc[has_o, cols["id_col"]].nunique()
-                g_v = mm.loc[has_o, cols["gmv"]].sum()
-                v1, v2, v3 = st.columns(3)
-                v1.metric(f"{mpick} 出单视频数", f"{n_v:,}", f"／{n_v_all:,} 条出现过的视频")
-                v2.metric(f"{mpick} 出单视频 GMV", f"${g_v:,.0f}")
-                v3.metric(f"{mpick} 视频出单转化", f"{n_v/n_v_all*100:.0f}%" if n_v_all else "—",
-                         help="出单视频数 ÷ 当月出现过的视频总数（同一视频可能出现在多天的文件里，已按 Video ID 去重）")
-                top_v = (mm[has_o].groupby([cols["id_col"], cols["name"]])[cols["gmv"]].sum()
-                        .reset_index().sort_values(cols["gmv"], ascending=False).head(15))
-                top_v[cols["gmv"]] = top_v[cols["gmv"]].map(lambda v: f"${v:,.0f}")
-                st.markdown(f"**{mpick} 出单最多的视频（Top 15）**")
-                st.dataframe(top_v.rename(columns={cols["name"]: "标题", cols["gmv"]: "当月GMV"}), hide_index=True)
-
-st.sidebar.markdown("---")
-st.sidebar.download_button("⬇️ 导出明细(长表) CSV",
-                           df.to_csv(index=False).encode("utf-8-sig"),
-                           "nailvesta_daily_long.csv", "text/csv")
+if has_ops:
+    st.sidebar.markdown("---")
+    st.sidebar.download_button("⬇️ 导出明细(长表) CSV",
+                               df.to_csv(index=False).encode("utf-8-sig"),
+                               "nailvesta_daily_long.csv", "text/csv")
