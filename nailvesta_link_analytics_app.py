@@ -1214,8 +1214,14 @@ if mode == "飞书 Base 直连":
         value=_sec("LARK_BASE_URL",
                    "https://qusjdzq12vah.sg.larksuite.com/base/XwZwbY0NTairFWsejC3lr0zjg0t"))
     app_id = _secret_field(st.sidebar, "App ID", "LARK_APP_ID",
-                           help="开放平台 → 企业自建应用 → 凭证与基础信息")
+                           help="开放平台 → 企业自建应用 → 凭证与基础信息。"
+                                "在 Streamlit Cloud 上部署时留空即可，去 Settings → Secrets 配一次，"
+                                "以后每次打开都会自动生效，不用手填。")
     app_secret = _secret_field(st.sidebar, "App Secret", "LARK_APP_SECRET")
+    if app_id and app_secret:
+        st.sidebar.caption("🔑 凭证已生效（来自 Secrets 或你刚手填的，长度都对得上），不用重复填。")
+    elif _sec("LARK_APP_ID") or _sec("LARK_APP_SECRET"):
+        st.sidebar.caption("⚠️ Secrets 里好像只配了一半（App ID / App Secret 缺一个），检查一下。")
     cache_dir = st.sidebar.text_input("本地缓存目录", value=_sec("LARK_CACHE_DIR", DEFAULT_CACHE),
                                       help="已下载的文件会跳过，不会重复下载")
 
@@ -1234,36 +1240,42 @@ if mode == "飞书 Base 直连":
 
     cta, ctb = st.sidebar.columns(2)
     if cta.button("① 测试连接"):
-        try:
-            _h = LARK_HOSTS[hostname]
-            _tk = lark_token(_h, app_id, app_secret)
-            _tbls = lark_tables(_h, _tk, parse_base_url(base_url))
-            _recs = lark_records(_h, _tk, parse_base_url(base_url), _tbls[0][0]) if _tbls else []
-            _atts = [a for r in _recs for v in r.get("fields", {}).values() if isinstance(v, list)
-                     for a in v if isinstance(a, dict)
-                     and str(a.get("name", "")).lower().endswith((".xlsx", ".xls"))]
-            # 真下载 1 个文件，验证 drive 下载权限（只数附件不够，下载权限是单独的）
-            _dl = "（没有附件可测）"
-            if _atts:
-                _rr = _lark_api(_h, f"/drive/v1/medias/{_atts[0]['file_token']}/download", token=_tk)
-                if _rr.status_code == 200 and len(_rr.content) > 1000:
-                    _dl = f"✅ 可下载（试下 {_atts[0]['name']}，{len(_rr.content)//1024} KB）"
-                else:
-                    try:
-                        _j = _rr.json()
-                        _dl = f"❌ {_j.get('code')} {_j.get('msg')}"
-                    except Exception:                      # noqa: BLE001
-                        _dl = f"❌ HTTP {_rr.status_code}"
-                    _dl += "\n\n→ 去开 `drive:drive:readonly` 权限，并重新创建版本发布"
-            _box = st.sidebar.success if _dl.startswith("✅") else st.sidebar.warning
-            _box(f"✅ 连接成功\n\n表：{len(_tbls)} 个（{_tbls[0][1] if _tbls else '—'}）\n\n"
-                 f"记录：{len(_recs)} 条\n\n附件：{len(_atts)} 个\n\n下载测试：{_dl}")
-        except NetworkError as e:
-            st.sidebar.error(f"🌐 {e}\n\n**这是网络问题，不是权限问题**——通常是 VPN 在切换或网络抖动。"
-                             "直接再点一次；一直失败再检查 VPN 是否开着。")
-        except Exception as e:                              # noqa: BLE001
-            st.sidebar.error(f"🔑 {e}\n\n这是**凭证/权限问题**：App ID/Secret 复制错 / 权限没发布 / "
-                             "应用没加为 Base 协作者 / 服务器选错（你的是 Lark 国际版）")
+        for _attempt in (0, 1):                              # token 本地缓存可能比 Lark 实际有效期活得久，遇到失效重试一次
+            try:
+                _h = LARK_HOSTS[hostname]
+                _tk = lark_token(_h, app_id, app_secret)
+                _tbls = lark_tables(_h, _tk, parse_base_url(base_url))
+                _recs = lark_records(_h, _tk, parse_base_url(base_url), _tbls[0][0]) if _tbls else []
+                _atts = [a for r in _recs for v in r.get("fields", {}).values() if isinstance(v, list)
+                         for a in v if isinstance(a, dict)
+                         and str(a.get("name", "")).lower().endswith((".xlsx", ".xls"))]
+                # 真下载 1 个文件，验证 drive 下载权限（只数附件不够，下载权限是单独的）
+                _dl = "（没有附件可测）"
+                if _atts:
+                    _rr = _lark_api(_h, f"/drive/v1/medias/{_atts[0]['file_token']}/download", token=_tk)
+                    if _rr.status_code == 200 and len(_rr.content) > 1000:
+                        _dl = f"✅ 可下载（试下 {_atts[0]['name']}，{len(_rr.content)//1024} KB）"
+                    else:
+                        try:
+                            _j = _rr.json()
+                            _dl = f"❌ {_j.get('code')} {_j.get('msg')}"
+                        except Exception:                      # noqa: BLE001
+                            _dl = f"❌ HTTP {_rr.status_code}"
+                        _dl += "\n\n→ 去开 `drive:drive:readonly` 权限，并重新创建版本发布"
+                _box = st.sidebar.success if _dl.startswith("✅") else st.sidebar.warning
+                _box(f"✅ 连接成功\n\n表：{len(_tbls)} 个（{_tbls[0][1] if _tbls else '—'}）\n\n"
+                     f"记录：{len(_recs)} 条\n\n附件：{len(_atts)} 个\n\n下载测试：{_dl}")
+                break
+            except NetworkError as e:
+                st.sidebar.error(f"🌐 {e}\n\n**这是网络问题，不是权限问题**——通常是 VPN 在切换或网络抖动。"
+                                 "直接再点一次；一直失败再检查 VPN 是否开着。")
+                break
+            except Exception as e:                              # noqa: BLE001
+                if _attempt == 0 and "access token" in str(e).lower():
+                    lark_token.clear()                            # 本地缓存的 token 可能已经过期，清掉重试
+                    continue
+                st.sidebar.error(f"🔑 {e}\n\n这是**凭证/权限问题**：App ID/Secret 复制错 / 权限没发布 / "
+                                 "应用没加为 Base 协作者 / 服务器选错（你的是 Lark 国际版）")
     if ctb.button("💾 保存凭证"):
         try:
             _save_secrets({"LARK_HOST": hostname, "LARK_BASE_URL": base_url,
@@ -1274,24 +1286,30 @@ if mode == "飞书 Base 直连":
             st.sidebar.error(f"保存失败：{e}")
 
     if st.sidebar.button("② 🔄 从 Base 拉取全部", type="primary"):
-        try:
-            got = lark_download_attachments(LARK_HOSTS[hostname], app_id, app_secret,
-                                            base_url, cache_dir)
-            fails = st.session_state.get("_lark_failed", [])
-            if got:
-                st.session_state["_payloads"] = got
-                st.sidebar.success(f"已获取 {len(got)} 个文件")
-            else:
-                st.sidebar.error("一个附件都没拿到——多半是 `drive:drive:readonly` 权限没开/没发布")
-            if fails:
-                st.sidebar.warning(f"⚠️ 有 {len(fails)} 个文件下载失败（已跳过，其余照常分析）。"
-                                   "网络抖动造成的话再点一次『拉取全部』即可，已下好的会走缓存不重下。")
-                with st.sidebar.expander(f"失败清单（{len(fails)}）"):
-                    st.text("\n".join(fails))
-        except NetworkError as e:
-            st.sidebar.error(f"🌐 {e}\n\n网络问题，再点一次即可（已下好的文件有缓存）。")
-        except Exception as e:                              # noqa: BLE001
-            st.sidebar.error(f"🔑 {e}")
+        for _attempt in (0, 1):
+            try:
+                got = lark_download_attachments(LARK_HOSTS[hostname], app_id, app_secret,
+                                                base_url, cache_dir)
+                fails = st.session_state.get("_lark_failed", [])
+                if got:
+                    st.session_state["_payloads"] = got
+                    st.sidebar.success(f"已获取 {len(got)} 个文件")
+                else:
+                    st.sidebar.error("一个附件都没拿到——多半是 `drive:drive:readonly` 权限没开/没发布")
+                if fails:
+                    st.sidebar.warning(f"⚠️ 有 {len(fails)} 个文件下载失败（已跳过，其余照常分析）。"
+                                       "网络抖动造成的话再点一次『拉取全部』即可，已下好的会走缓存不重下。")
+                    with st.sidebar.expander(f"失败清单（{len(fails)}）"):
+                        st.text("\n".join(fails))
+                break
+            except NetworkError as e:
+                st.sidebar.error(f"🌐 {e}\n\n网络问题，再点一次即可（已下好的文件有缓存）。")
+                break
+            except Exception as e:                              # noqa: BLE001
+                if _attempt == 0 and "access token" in str(e).lower():
+                    lark_token.clear()
+                    continue
+                st.sidebar.error(f"🔑 {e}")
     if os.path.isdir(st.session_state.get("_cache_dir", DEFAULT_CACHE)) and \
             not st.session_state.get("_payloads"):
         if st.sidebar.button("📂 直接用本地缓存（离线）"):
@@ -1345,20 +1363,26 @@ with st.sidebar.expander("达人组数据连接", expanded=not bool(st.session_s
         if not _cr_id or not _cr_secret:
             st.error("没有可用的 App ID / Secret——去上面「飞书 Base 直连」填一份，或在这里单独填。")
         else:
-            try:
-                secs, cells, failed = lark_creator_fetch_all(LARK_HOSTS[_cr_host_name], _cr_id, _cr_secret,
-                                                              cr_url, cr_cache)
-                st.session_state["_creator_data"] = secs
-                shp = "、".join(f"{n}（{d.shape[0]:,}行）" for n, d in secs.items())
-                st.success(f"✅ 扫到 {len(cells)} 个附件，成功 {len(cells)-len(failed)} 个：{shp}")
-                if failed:
-                    st.warning(f"⚠️ {len(failed)} 个下载/解析失败（其余照常用）")
-                    with st.expander("失败清单"):
-                        st.text("\n".join(failed))
-            except NetworkError as e:
-                st.error(f"🌐 {e}")
-            except Exception as e:                              # noqa: BLE001
-                st.error(f"🔑 {e}")
+            for _attempt in (0, 1):
+                try:
+                    secs, cells, failed = lark_creator_fetch_all(LARK_HOSTS[_cr_host_name], _cr_id, _cr_secret,
+                                                                  cr_url, cr_cache)
+                    st.session_state["_creator_data"] = secs
+                    shp = "、".join(f"{n}（{d.shape[0]:,}行）" for n, d in secs.items())
+                    st.success(f"✅ 扫到 {len(cells)} 个附件，成功 {len(cells)-len(failed)} 个：{shp}")
+                    if failed:
+                        st.warning(f"⚠️ {len(failed)} 个下载/解析失败（其余照常用）")
+                        with st.expander("失败清单"):
+                            st.text("\n".join(failed))
+                    break
+                except NetworkError as e:
+                    st.error(f"🌐 {e}")
+                    break
+                except Exception as e:                              # noqa: BLE001
+                    if _attempt == 0 and "access token" in str(e).lower():
+                        lark_token.clear()
+                        continue
+                    st.error(f"🔑 {e}")
 if st.session_state.get("_creator_data"):
     st.sidebar.caption("达人组数据：已载入 " +
                        "、".join(f"{n}{len(d):,}行" for n, d in st.session_state["_creator_data"].items()))
