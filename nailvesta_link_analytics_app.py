@@ -560,13 +560,38 @@ def _to_num(s: pd.Series) -> pd.Series:
                          .str.strip().replace({"": None, "-": None}), errors="coerce")
 
 
+def _parse_duration(s: pd.Series) -> pd.Series:
+    """'1m28s'/'5s'/'0s' -> 秒数（float）。"""
+    ss = s.astype("string")
+    m = ss.str.extract(r"(?:(\d+)m)?(?:(\d+)s)?")
+    mins = pd.to_numeric(m[0], errors="coerce").fillna(0)
+    secs = pd.to_numeric(m[1], errors="coerce").fillna(0)
+    out = mins * 60 + secs
+    out[ss.isna()] = np.nan
+    return out
+
+
+def _clean_pid(s: pd.Series) -> pd.Series:
+    """Product ID 统一成字符串、去掉尾巴 .0，跟运营数据的 pid 对上号，才能两边联查。"""
+    return (s.astype("string").str.strip().str.replace(r"\.0$", "", regex=True))
+
+
 def _creator_clean_df(raw: pd.DataFrame) -> pd.DataFrame:
-    """金额/百分比字符串("$205.33"/"4.11%")转数字；其余原样。"""
+    """
+    金额/百分比字符串("$205.33"/"4.11%"/"2.72%")转数字；"1m28s"这种时长转成秒；
+    Product ID/Video ID/LIVE ID 统一成字符串（Product ID 要跟运营数据的 pid 对得上，才能两边联查）。
+    """
     out = raw.copy()
     for col in out.columns:
         cl = str(col)
-        if any(k in cl for k in ("GMV", "Refunds", "AOV", "commission", "fee", "GPM", "CTR", "CTOR",
-                                  "rate", "Rate")):
+        if cl in ("Avg. viewing duration",):
+            out[col] = _parse_duration(out[col])
+        elif cl == "Product ID":
+            out[col] = _clean_pid(out[col])
+        elif cl in ("Video ID", "LIVE ID"):
+            out[col] = out[col].astype("string")
+        elif any(k in cl for k in ("GMV", "Refunds", "AOV", "commission", "fee", "GPM", "CTR", "CTOR",
+                                    "rate", "Rate", "Engagement")):
             out[col] = _to_num(out[col])
     return out
 
@@ -1506,6 +1531,383 @@ def _creator_period_key(t: pd.DataFrame, gran: str) -> pd.Series:
     return t["_d"].dt.to_period("M").dt.start_time.dt.date
 
 
+# 达人组·全字段目录：每张表除了 ID/名称/日期以外的字段，自动归到 前端(曝光/互动/内容产出) 或 后端(成交/成本/售后)。
+# 跟运营数据的『指标归档』是同一个思路，只是达人组这边维度更细分。
+_CREATOR_NONMETRIC = {"_date", "_gran", "_month", "_src_file", "Creator name", "Product name", "Product ID",
+                     "Product category", "Video title", "Video ID", "Post date", "Video link", "LIVE title",
+                     "LIVE ID", "LIVE start time", "LIVE end time"}
+
+
+def creator_classify(col: str) -> tuple[str, str]:
+    """返回 (前端/后端, 细分类)。"""
+    c = col.lower()
+    if "flat fee" in c:
+        return "后端", "成本（该字段目前恒为0）"
+    if any(k in c for k in ("commission",)):
+        return "后端", "成本"
+    if any(k in c for k in ("refund",)):
+        return "后端", "售后"
+    if any(k in c for k in ("gmv", "order", "items sold", "aov", "customer", "products sold", "gpm",
+                            "avg. gmv")):
+        return "后端", "成交"
+    if any(k in c for k in ("like", "comment", "share", "engagement", "completion", "duration")):
+        return "前端", "互动质量"
+    # 曝光/播放/点击类要先判——"Video views"/"Video product impressions" 这类字段名里也带 "video"，
+    # 但量级是千万级曝光而不是内容条数，混进"内容产出"会在图上把内容条数(个位数~千)压成一条 0 线。
+    if any(k in c for k in ("impression", "view", "click", "ctr", "ctor", "tap-through", "viewer")):
+        return "前端", "曝光与转化"
+    if any(k in c for k in ("video", "live stream", "sample", "showcase", "posted content")):
+        return "前端", "内容产出"
+    return "后端", "其他"
+
+
+@st.cache_data(show_spinner=False)
+def creator_catalog(cols_by_sec: dict) -> pd.DataFrame:
+    """全字段目录表：部分 / 字段 / 分类 / 细分类。cols_by_sec = {表名: [列名,...]}。"""
+    rows = []
+    for sec, cols in cols_by_sec.items():
+        for c in cols:
+            if c in _CREATOR_NONMETRIC:
+                continue
+            cat, sub = creator_classify(c)
+            rows.append({"部分": sec, "字段": c, "分类": cat, "细分类": sub})
+    return pd.DataFrame(rows)
+
+
+def _creator_period_series(t: pd.DataFrame, col: str, gran: str, how: str = "sum") -> pd.DataFrame:
+    """把某个字段按粒度聚合成时间序列（求和型字段用 sum，比率型字段用 mean）。"""
+    key = _creator_period_key(t, gran)
+    g = t.groupby(key)[col].agg(how).reset_index()
+    g.columns = ["期间", col]
+    return g
+
+
+def render_creator_field_group(cdata: dict, sec: str, sub: str, fields: list[str], gran: str):
+    """某个部分(sec)、某个细分类(sub) 下的所有字段，画在一张图里（求和型字段叠加对比走势）。"""
+    if sec not in cdata:
+        return
+    t = _creator_daily(cdata[sec])
+    frames = []
+    for f in fields:
+        if f not in t.columns:
+            continue
+        # 比率型字段(CTR/CTOR/Completion rate/Engagement/...rate)求均值；Likes/Comments/Shares/时长/次数求和
+        how = "mean" if any(k in f for k in ("rate", "Rate", "Engagement", "CTR", "CTOR")) else "sum"
+        g = _creator_period_series(t, f, gran, how)
+        g["字段"] = f + ("（日均）" if how == "mean" and gran != "日" else "")
+        g = g.rename(columns={f: "值"})
+        frames.append(g)
+    if not frames:
+        return
+    allg = pd.concat(frames, ignore_index=True)
+    fig = px.line(allg, x="期间", y="值", color="字段", markers=(gran != "日"),
+                 labels={"期间": ""})
+    fig.update_layout(height=280, margin=dict(t=30, b=10), hovermode="x unified",
+                      legend=dict(orientation="h", y=1.18), title=f"{sec} · {sub}")
+    st.plotly_chart(fig)
+
+
+def render_creator_catalog_section(cdata: dict):
+    """全字段总览：目录统计 + 按 表×细分类 分组的完整趋势（这是回应"读取每一个字段"的核心部分）。"""
+    cols_by_sec = {sec: list(cdata[sec].columns) for sec in CREATOR_ORDER if sec in cdata}
+    cat = creator_catalog(cols_by_sec)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("达人组字段总数", len(cat))
+    c2.metric("前端字段（曝光/互动/内容）", int((cat["分类"] == "前端").sum()))
+    c3.metric("后端字段（成交/成本/售后）", int((cat["分类"] == "后端").sum()))
+    with st.expander("📋 展开完整字段目录（部分 × 字段 × 分类）"):
+        fcat = st.multiselect("筛选分类", sorted(cat["分类"].unique()), default=sorted(cat["分类"].unique()),
+                              key="cr_cat_filter")
+        st.dataframe(cat[cat["分类"].isin(fcat)].sort_values(["部分", "分类", "细分类"]), hide_index=True,
+                    height=420)
+        st.download_button("⬇️ 导出字段目录 CSV", cat.to_csv(index=False).encode("utf-8-sig"),
+                           "达人组_字段目录.csv", "text/csv", key="cr_cat_dl")
+
+    st.markdown("#### 全字段趋势（按 表 × 分类 分组，一次看全）")
+    gran_cat = st.radio("粒度　", ["日", "周", "月"], horizontal=True, index=2, key="cr_cat_gran")
+    pick_sec = st.selectbox("选一张表深入看", [s for s in CREATOR_ORDER if s in cdata], key="cr_cat_sec")
+    subs = cat[cat["部分"] == pick_sec].groupby("细分类")["字段"].apply(list).to_dict()
+    # 按固定顺序展示，读起来像运营数据的前端/后端分区
+    order = ["曝光与转化", "互动质量", "内容产出", "成交", "成本", "售后", "其他"]
+    for sub in order:
+        if sub not in subs:
+            continue
+        render_creator_field_group(cdata, pick_sec, sub, subs[sub], gran_cat)
+
+
+# ── 达人组·排行榜 ──────────────────────────────────────────────────────
+CREATOR_RANK_METRICS = {
+    "Creators": [("GMV", "Creator-attributed GMV", "sum", "money"), ("出单数", "Attributed orders", "sum", "count"),
+                ("内容量(视频+直播)", None, "content", "count"), ("Est. 佣金", "Est. commission", "sum", "money"),
+                ("曝光", "Product impressions", "sum", "count"), ("CTR", "CTR", "mean", "pct")],
+    "Products": [("GMV", "Creator-attributed GMV", "sum", "money"), ("出单数", "Attributed orders", "sum", "count"),
+                ("曝光", "Product impressions", "sum", "count"), ("参与达人数", "Creators posted content", "sum", "count"),
+                ("出单达人数", "Creators with sales", "sum", "count"), ("Est. 佣金", "Est. commission", "sum", "money")],
+    "Videos": [("GMV", "Creator video-attributed GMV", "sum", "money"), ("播放量", "Video views", "sum", "count"),
+              ("点赞数", "Likes", "sum", "count"), ("Engagement", "Engagement", "mean", "pct"),
+              ("完播率 Completion rate", "Completion rate", "mean", "pct"), ("Video GPM", "Video GPM", "mean", "money")],
+    "LIVE": [("GMV", "Creator LIVE-attributed GMV", "sum", "money"), ("观众数", "LIVE product viewers", "sum", "count"),
+            ("Tap-through rate", "Tap-through rate", "mean", "pct"), ("平均观看时长(秒)", "Avg. viewing duration", "mean", "num"),
+            ("点赞数", "Likes", "sum", "count"), ("Engagement", "Engagement", "mean", "pct")],
+}
+
+
+def _rank_fmt(v, kind):
+    if pd.isna(v):
+        return "—"
+    return {"money": f"${v:,.2f}", "count": f"{v:,.0f}", "pct": f"{v:.2f}%", "num": f"{v:,.0f}"}[kind]
+
+
+def page_creator_leaderboard():
+    st.title("达人组 · 排行榜")
+    st.caption("Creators / Videos / LIVE 三张表各自的排行——不只是 GMV，播放量、互动率、完播率、佣金成本都能排。")
+    cdata = st.session_state.get("_creator_data")
+    if not cdata:
+        st.info("👈 左侧先拉达人组数据。")
+        return
+    sec = st.radio("看哪张表", [s for s in CREATOR_ORDER if s in cdata], horizontal=True, key="cr_rk_sec")
+    t = _creator_daily(cdata[sec])
+    gran_r = st.radio("统计范围", ["全部区间", "最近7天", "最近30天"], horizontal=True, key="cr_rk_range")
+    if gran_r != "全部区间":
+        n = 7 if gran_r == "最近7天" else 30
+        cutoff = t["_d"].max() - pd.Timedelta(days=n - 1)
+        t = t[t["_d"] >= cutoff]
+    id_col = CREATOR_COLS[sec].get("creator") or CREATOR_COLS[sec].get("id_col") or CREATOR_COLS[sec]["name"]
+    name_col = CREATOR_COLS[sec]["name"]
+    metrics = CREATOR_RANK_METRICS[sec]
+    labels = [m[0] for m in metrics]
+    pick = st.selectbox("排序指标", labels, key="cr_rk_metric")
+    lbl, col, how, kind = next(m for m in metrics if m[0] == pick)
+
+    grp_cols = [id_col] if id_col == name_col else [id_col, name_col]
+    if col is None and how == "content":                     # Creators 专用：内容量 = 视频+直播条数
+        agg = t.groupby(grp_cols).agg(视频数=("Videos", "sum"), 直播数=("LIVE streams", "sum")).reset_index()
+        agg["值"] = agg["视频数"] + agg["直播数"]
+        agg = agg.sort_values("值", ascending=False)
+    else:
+        agg = t.groupby(grp_cols)[col].agg(how).reset_index().rename(columns={col: "值"})
+        agg = agg.sort_values("值", ascending=False)
+    agg = agg[agg["值"].notna() & (agg["值"] != 0)]
+    top = agg.head(20)
+    disp_name = top[name_col] if name_col in top.columns else top[id_col]
+    fig = go.Figure(go.Bar(x=top["值"], y=disp_name.astype(str).str[:40], orientation="h",
+                          marker_color="#C2416B",
+                          text=[_rank_fmt(v, kind) for v in top["值"]], textposition="outside"))
+    fig.update_layout(height=max(360, 26 * len(top) + 60), margin=dict(t=30, b=10),
+                      yaxis=dict(autorange="reversed"), title=f"{sec} · Top 20 按「{pick}」排序（{gran_r}）")
+    st.plotly_chart(fig)
+
+    show = top.copy()
+    show["值"] = show["值"].map(lambda v: _rank_fmt(v, kind))
+    st.dataframe(show.rename(columns={"值": pick}), hide_index=True)
+    st.download_button(f"⬇️ 导出 {sec} 排行 CSV", agg.to_csv(index=False).encode("utf-8-sig"),
+                       f"达人组_{sec}_排行_{pick}.csv", "text/csv", key="cr_rk_dl")
+
+
+# ── 达人组·内容与互动质量 ────────────────────────────────────────────────
+def page_creator_content():
+    st.title("达人组 · 内容与互动质量")
+    st.caption("延伸分析：不只是出了多少内容，还看内容做得好不好——完播率、互动率、观看时长有没有在变差；"
+              "样品寄出后有多少真的转化成了内容。")
+    cdata = st.session_state.get("_creator_data")
+    if not cdata:
+        st.info("👈 左侧先拉达人组数据。")
+        return
+    gran_c = st.radio("粒度", ["日", "周", "月"], horizontal=True, index=1, key="cr_ct_gran")
+
+    st.markdown("#### 内容生产节奏：每天/周有多少条新视频、新直播")
+    cc1, cc2 = st.columns(2)
+    if "Videos" in cdata:
+        v = _creator_daily(cdata["Videos"])
+        g = v.groupby(_creator_period_key(v, gran_c))["Video ID"].nunique().reset_index()
+        g.columns = ["期间", "视频条数"]
+        f1 = px.bar(g, x="期间", y="视频条数")
+        f1.update_traces(marker_color="#1B3A8C")
+        f1.update_layout(height=280, margin=dict(t=30, b=10), title="视频产出节奏（去重条数）")
+        cc1.plotly_chart(f1)
+    if "LIVE" in cdata:
+        l = _creator_daily(cdata["LIVE"])
+        g = l.groupby(_creator_period_key(l, gran_c))["LIVE ID"].nunique().reset_index()
+        g.columns = ["期间", "直播场数"]
+        f2 = px.bar(g, x="期间", y="直播场数")
+        f2.update_traces(marker_color="#F08C00")
+        f2.update_layout(height=280, margin=dict(t=30, b=10), title="直播产出节奏（去重场数）")
+        cc2.plotly_chart(f2)
+
+    st.markdown("#### 内容质量趋势：完播率 / 互动率 / 观看时长有没有在变差")
+    qc1, qc2 = st.columns(2)
+    if "Videos" in cdata:
+        v = _creator_daily(cdata["Videos"])
+        g1 = _creator_period_series(v, "Completion rate", gran_c, "mean")
+        g2 = _creator_period_series(v, "Engagement", gran_c, "mean")
+        f3 = go.Figure()
+        f3.add_trace(go.Scatter(x=g1["期间"], y=g1["Completion rate"], name="完播率%", line=dict(color="#C2416B")))
+        f3.add_trace(go.Scatter(x=g2["期间"], y=g2["Engagement"], name="Engagement%", line=dict(color="#4C6EF5"), yaxis="y2"))
+        f3.update_layout(height=300, margin=dict(t=30, b=10), hovermode="x unified", title="Videos：完播率 & Engagement",
+                         yaxis=dict(title="完播率%"), yaxis2=dict(title="Engagement%", overlaying="y", side="right"),
+                         legend=dict(orientation="h", y=1.15))
+        qc1.plotly_chart(f3)
+    if "LIVE" in cdata:
+        l = _creator_daily(cdata["LIVE"])
+        g3 = _creator_period_series(l, "Avg. viewing duration", gran_c, "mean")
+        g4 = _creator_period_series(l, "Tap-through rate", gran_c, "mean")
+        f4 = go.Figure()
+        f4.add_trace(go.Scatter(x=g3["期间"], y=g3["Avg. viewing duration"], name="平均观看时长(秒)", line=dict(color="#F08C00")))
+        f4.add_trace(go.Scatter(x=g4["期间"], y=g4["Tap-through rate"], name="Tap-through rate%", line=dict(color="#1B3A8C"), yaxis="y2"))
+        f4.update_layout(height=300, margin=dict(t=30, b=10), hovermode="x unified", title="LIVE：观看时长 & Tap-through rate",
+                         yaxis=dict(title="秒"), yaxis2=dict(title="%", overlaying="y", side="right"),
+                         legend=dict(orientation="h", y=1.15))
+        qc2.plotly_chart(f4)
+
+    st.markdown("#### 互动量趋势：Likes / Comments / Shares（Videos + LIVE 合计）")
+    frames = []
+    for sec in ["Videos", "LIVE"]:
+        if sec not in cdata:
+            continue
+        t = _creator_daily(cdata[sec])
+        key = _creator_period_key(t, gran_c)
+        g = t.groupby(key)[["Likes", "Comments", "Shares"]].sum().reset_index()
+        g = g.rename(columns={g.columns[0]: "期间"})
+        g["部分"] = sec
+        frames.append(g)
+    if frames:
+        allg = pd.concat(frames, ignore_index=True)
+        melt = allg.melt(id_vars=["期间", "部分"], value_vars=["Likes", "Comments", "Shares"],
+                         var_name="互动类型", value_name="数量")
+        f5 = px.bar(melt, x="期间", y="数量", color="互动类型", facet_col="部分", barmode="stack")
+        f5.update_layout(height=320, margin=dict(t=40, b=10))
+        st.plotly_chart(f5)
+
+    st.markdown("#### 样品转化效率：寄了样品，有多少真的变成了内容")
+    if "Products" in cdata:
+        p = _creator_daily(cdata["Products"])
+        g = p.groupby(_creator_period_key(p, gran_c)).agg(
+            样品寄出=("Samples shipped", "sum"), 样品内容量=("Total sample content", "sum"),
+            出单视频数=("Videos with sales", "sum"), 出单直播数=("LIVE streams with sales", "sum")).reset_index()
+        g.columns = ["期间", "样品寄出", "样品内容量", "出单视频数", "出单直播数"]
+        g["样品→内容转化率%"] = np.where(g["样品寄出"] > 0, g["样品内容量"] / g["样品寄出"] * 100, np.nan)
+        f6 = go.Figure()
+        f6.add_bar(x=g["期间"], y=g["样品寄出"], name="样品寄出", marker_color="#8A727C")
+        f6.add_bar(x=g["期间"], y=g["样品内容量"], name="样品带来的内容量", marker_color="#C2416B")
+        f6.add_trace(go.Scatter(x=g["期间"], y=g["样品→内容转化率%"], name="转化率%", mode="lines+markers",
+                                line=dict(color="#4C6EF5", width=2), yaxis="y2"))
+        f6.update_layout(barmode="group", height=320, margin=dict(t=30, b=10), hovermode="x unified",
+                         yaxis2=dict(title="转化率%", overlaying="y", side="right"),
+                         legend=dict(orientation="h", y=1.15))
+        st.plotly_chart(f6)
+        disp = g.copy()
+        disp["样品→内容转化率%"] = disp["样品→内容转化率%"].map(lambda v: "—" if pd.isna(v) else f"{v:.1f}%")
+        st.dataframe(disp, hide_index=True)
+    else:
+        st.caption("没有 Products 数据，算不了样品转化。")
+
+
+# ── 运营数据 × 达人组数据 整合归因（供 render_compare() 调用）──────────────
+def render_creator_cross_check(a0, a1, b0, b1, sc: dict, sb: dict):
+    """两段对比里运营数据只看得到『达人 Affiliate 渠道』的 GMV/曝光结果数字；
+    这里换到达人组自己的表，同一本期/基期窗口去看『为什么』：内容供给(视频/直播条数)、
+    参与达人数、内容质量(完播率/Engagement) 各自怎么变的，跟渠道 GMV 的涨跌方向对不对得上。"""
+    cdata = st.session_state.get("_creator_data")
+    if not cdata or "Creators" not in cdata:
+        return
+    st.markdown("---")
+    st.markdown("#### 达人侧同期对照：运营数据看到「达人渠道」变了，达人组数据里为什么")
+    st.caption("同样的本期/基期两个窗口，换一张表看：不是渠道 GMV 的结果数字，而是供给端——"
+              "内容量、参与达人数、内容质量，跟渠道 GMV 的涨跌方向对不对得上。")
+
+    colc = CREATOR_COLS["Creators"]
+    tc = _creator_daily(cdata["Creators"])
+    ccur, cbas = tc[tc["_d"].between(a0, a1)], tc[tc["_d"].between(b0, b1)]
+    if ccur.empty or cbas.empty:
+        st.caption("达人组数据在这两段窗口里覆盖不全，跳过对照。")
+        return
+    cov_end = tc["_d"].max()
+    if cov_end < a1:
+        st.warning(md(f"⚠️ 达人组数据只更新到 {cov_end:%m-%d}，比本期窗口结束的 {a1:%m-%d} 早——"
+                      f"下面本期的数字是不完整的（少了 {(a1 - cov_end).days} 天），"
+                      "『两个口径差异』会显得偏大，是**数据滞后**不是口径错，等达人组数据补上再看这个对照更准。"))
+    g_cur, g_bas = ccur[colc["gmv"]].sum(), cbas[colc["gmv"]].sum()
+    n_cur, n_bas = ccur[colc["name"]].nunique(), cbas[colc["name"]].nunique()
+    o_cur = ccur.loc[ccur[colc["orders"]].fillna(0) > 0, colc["name"]].nunique()
+    o_bas = cbas.loc[cbas[colc["orders"]].fillna(0) > 0, colc["name"]].nunique()
+
+    vcur = vbas = lcur = lbas = np.nan
+    tv = tl = None
+    if "Videos" in cdata:
+        tv = _creator_daily(cdata["Videos"])
+        vcur = tv[tv["_d"].between(a0, a1)]["Video ID"].nunique()
+        vbas = tv[tv["_d"].between(b0, b1)]["Video ID"].nunique()
+    if "LIVE" in cdata:
+        tl = _creator_daily(cdata["LIVE"])
+        lcur = tl[tl["_d"].between(a0, a1)]["LIVE ID"].nunique()
+        lbas = tl[tl["_d"].between(b0, b1)]["LIVE ID"].nunique()
+
+    qcur_comp = qbas_comp = qcur_eng = qbas_eng = np.nan
+    if tv is not None:
+        qcur_comp = tv[tv["_d"].between(a0, a1)]["Completion rate"].mean()
+        qbas_comp = tv[tv["_d"].between(b0, b1)]["Completion rate"].mean()
+        qcur_eng = tv[tv["_d"].between(a0, a1)]["Engagement"].mean()
+        qbas_eng = tv[tv["_d"].between(b0, b1)]["Engagement"].mean()
+
+    ops_gmv_c, ops_gmv_b = sc.get("ch_cre", np.nan), sb.get("ch_cre", np.nan)
+
+    r1 = st.columns(4)
+    r1[0].metric("运营数据·达人渠道GMV", usd(ops_gmv_c, sign=False), chg_txt(ops_gmv_c, ops_gmv_b, "money") + " vs基期")
+    r1[1].metric("达人组数据·Creators表GMV", usd(g_cur, sign=False), chg_txt(g_cur, g_bas, "money") + " vs基期")
+    diffc = pct(g_cur, ops_gmv_c) if ops_gmv_c else np.nan
+    r1[2].metric("两个口径差异", f"{diffc:+.1f}%" if pd.notna(diffc) else "—",
+                 help="两个数据源理论上应该很接近，差异过大说明两边窗口对齐或统计口径有问题")
+    r1[3].metric("出单达人数", f"{o_cur:,}", f"{o_cur - o_bas:+,} vs基期／表里共{n_cur:,}位达人")
+
+    r2 = st.columns(4)
+    r2[0].metric("视频条数（去重）", f"{vcur:,.0f}" if pd.notna(vcur) else "—",
+                 f"{vcur - vbas:+,.0f} vs基期" if pd.notna(vcur) and pd.notna(vbas) else None)
+    r2[1].metric("直播场数（去重）", f"{lcur:,.0f}" if pd.notna(lcur) else "—",
+                 f"{lcur - lbas:+,.0f} vs基期" if pd.notna(lcur) and pd.notna(lbas) else None)
+    r2[2].metric("视频完播率", f"{qcur_comp:.1f}%" if pd.notna(qcur_comp) else "—",
+                 f"{qcur_comp - qbas_comp:+.1f}pp vs基期" if pd.notna(qcur_comp) and pd.notna(qbas_comp) else None)
+    r2[3].metric("视频Engagement", f"{qcur_eng:.2f}%" if pd.notna(qcur_eng) else "—",
+                 f"{qcur_eng - qbas_eng:+.2f}pp vs基期" if pd.notna(qcur_eng) and pd.notna(qbas_eng) else None)
+
+    gmv_chg = pct(ops_gmv_c, ops_gmv_b)
+    if pd.isna(gmv_chg) or abs(gmv_chg) < 5:
+        return
+    dirn = "上升" if gmv_chg > 0 else "下降"
+    drivers = []
+    if pd.notna(vcur) and pd.notna(vbas) and vbas > 0:
+        vchg = pct(vcur, vbas)
+        if pd.notna(vchg) and abs(vchg) >= 5 and (vchg > 0) == (gmv_chg > 0):
+            drivers.append(f"视频条数{vchg:+.0f}%（{vbas:.0f}→{vcur:.0f}）")
+    if pd.notna(lcur) and pd.notna(lbas) and lbas > 0:
+        lchg = pct(lcur, lbas)
+        if pd.notna(lchg) and abs(lchg) >= 5 and (lchg > 0) == (gmv_chg > 0):
+            drivers.append(f"直播场数{lchg:+.0f}%（{lbas:.0f}→{lcur:.0f}）")
+    if n_bas > 0:
+        nchg = pct(n_cur, n_bas)
+        if pd.notna(nchg) and abs(nchg) >= 5 and (nchg > 0) == (gmv_chg > 0):
+            drivers.append(f"参与达人数{nchg:+.0f}%（{n_bas:.0f}→{n_cur:.0f}）")
+    if drivers:
+        st.info(md(f"达人渠道GMV{dirn}{gmv_chg:+.0f}%，达人组数据里方向一致的变化：" + "、".join(drivers) +
+                   "——**供给端**（内容量/参与达人数）大概率是主因。"))
+    elif pd.notna(qcur_comp) and pd.notna(qbas_comp) and abs(qcur_comp - qbas_comp) >= 2:
+        st.info(md(f"达人渠道GMV{dirn}{gmv_chg:+.0f}%，但视频/直播条数、参与达人数都没有同向明显变化——"
+                   f"完播率从{qbas_comp:.1f}%→{qcur_comp:.1f}%，更像是**内容质量**在变，不是供给量的问题。"))
+    else:
+        st.info(md(f"达人渠道GMV{dirn}{gmv_chg:+.0f}%，但达人组数据里内容量/达人数/完播率都没有明显同向变化——"
+                   "可能是**达人组以外的因素**（TikTok 大盘流量、达人个人账号权重等）在起作用，值得再往下查。"))
+
+
+def page_creator_catalog():
+    st.title("达人组 · 全字段总览")
+    st.caption("不止「必须要看」的几个指标——达人表格里能拿到的每一个字段都在这里，"
+              "跟运营数据的「指标归档」是同一个思路：自动归到前端(曝光/互动/内容产出)或后端(成交/成本/售后)。")
+    cdata = st.session_state.get("_creator_data")
+    if not cdata:
+        st.info("👈 左侧先拉达人组数据。")
+        return
+    render_creator_catalog_section(cdata)
+
+
 def render_creator_tab():
     """
     达人组数据整块内容——独立成函数是因为它完全不依赖运营数据的 df/catalog，
@@ -2163,6 +2565,9 @@ def render_compare():
         st.dataframe(pd.DataFrame(out), hide_index=True)
     else:
         st.caption(f"本期没有哪一天偏离前 7 日均 ≥ {thr}%。")
+
+    # ⑨ 达人组交叉对照——运营数据的『达人渠道』结果数字，配上达人组自己数据的『为什么』
+    render_creator_cross_check(a0, a1, b0, b1, sc, sb)
 
 
 def page_compare():
@@ -2943,7 +3348,12 @@ if has_ops:
     ]
     nav_sections["参考"] = [_reg("catalog", page_catalog, "指标归档", "📚")]
 if has_creator:
-    nav_sections["达人组"] = [_reg("creator", render_creator_tab, "达人组数据", "🎨")]
+    nav_sections["达人组"] = [
+        _reg("creator", render_creator_tab, "总览", "🎨"),
+        _reg("creator_catalog", page_creator_catalog, "全字段目录", "📖"),
+        _reg("creator_rank", page_creator_leaderboard, "排行榜", "🏆"),
+        _reg("creator_content", page_creator_content, "内容与互动质量", "🎬"),
+    ]
 
 pg = st.navigation(nav_sections, position="sidebar", expanded=True)
 pg.run()
