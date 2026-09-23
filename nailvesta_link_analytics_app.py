@@ -1723,6 +1723,70 @@ def _cr_kind(field: str) -> str:
     return "计数"
 
 
+# 达人组四个 Excel：中文名、去重 ID 列、判定「出单」的列、名词、GMV/订单/点击列、比率字段的加权列
+CR_TABLES = {
+    "Creators": ("达人表", "Creator name", "Attributed orders", "达人", "Creator-attributed GMV",
+                 "Attributed orders", None, {"CTR": "Product impressions"}, "Product impressions"),
+    "Products": ("链接表", "Product ID", "Creator-attributed GMV", "链接", "Creator-attributed GMV",
+                 "Attributed orders", "Product clicks", {"CTR": "Product impressions"}, "Product impressions"),
+    "Videos": ("视频表", "Video ID", "Creator video-attributed GMV", "视频", "Creator video-attributed GMV",
+               "Video-attributed orders", "Video product clicks",
+               {"CTR": "Video product impressions", "Avg. GMV per customer": "Video-attributed orders"},
+               "Video views"),
+    "LIVE": ("直播表", "LIVE ID", "Creator LIVE-attributed GMV", "直播", "Creator LIVE-attributed GMV",
+             "LIVE-attributed orders", "Product clicks",
+             {"CTR": "LIVE product impressions", "Tap-through rate": "Impressions", "Show GPM": "Impressions",
+              "Avg. GMV per customer": "LIVE-attributed orders"}, "LIVE product viewers"),
+}
+CR_PCT_FIELDS = {"CTR", "CTOR", "Engagement", "Completion rate", "Tap-through rate"}
+CR_FIELD_CN = {
+    "Creator-attributed GMV": "达人带货 GMV", "Creator LIVE-attributed GMV": "达人直播 GMV",
+    "Creator video-attributed GMV": "达人视频 GMV", "Affiliate product card-attributed GMV": "商品卡 GMV",
+    "Refunds": "退款金额", "Items refunded": "退款件数", "Attributed orders": "订单数",
+    "Creator-attributed items sold": "售出件数", "AOV": "客单价", "CTOR": "点击成单率", "CTR": "点击率",
+    "LIVE streams": "直播场数（新开）", "Videos": "视频数（新发）", "Total sample content": "样品产出内容数",
+    "Samples shipped": "寄样数", "Products added to showcase": "加入橱窗的商品数",
+    "Product impressions": "商品曝光", "Product clicks": "商品点击", "Video views": "视频播放",
+    "Customers": "买家数", "Products sold": "售出商品数", "Est. commission": "预估佣金",
+    "Est. flat fee": "预估固定费用（恒为 0）", "Videos with sales": "出单视频数", "LIVE streams with sales": "出单直播数",
+    "Creators posted content": "发布内容的达人数", "Creators with sales": "出单达人数",
+    "Video-attributed orders": "视频订单数", "Video-attributed items sold": "视频售出件数", "Likes": "点赞",
+    "Comments": "评论", "Shares": "分享", "Video product impressions": "视频商品曝光",
+    "Video product clicks": "视频商品点击", "Completion rate": "完播率", "Video GPM": "千次播放 GMV",
+    "Engagement": "互动率", "Avg. GMV per customer": "人均 GMV", "LIVE-attributed items sold": "直播售出件数",
+    "LIVE-attributed orders": "直播订单数", "Avg. viewing duration": "平均观看时长（秒）",
+    "LIVE product impressions": "直播商品曝光", "Impressions": "直播间曝光", "Show GPM": "千次曝光 GMV",
+    "LIVE product viewers": "直播商品观众", "Tap-through rate": "点进率",
+}
+
+
+def cr_agg(T: pd.DataFrame, tname: str, key: pd.Series) -> pd.DataFrame:
+    """一张达人 Excel 的全部数值字段按 key（日期 / 周 / 月 / 本期·上一段…）汇总，列顺序 = Excel 原始顺序。
+    可加的字段求和；比率/均值字段按曝光、播放、观众等加权重算（客单价、CTOR 用合计重算）；
+    最后两列是这一组里的去重个数：表里出现的 X 数、出单 X 数。"""
+    _, idc, sellc, noun, gmvc, ordc, clkc, wmap, wdef = CR_TABLES[tname]
+    key = pd.Series(np.asarray(key), index=T.index)
+    num_cols = [c for c in T.columns if c not in _CREATOR_NONMETRIC and c != "日期" and not c.startswith("_")
+                and pd.api.types.is_numeric_dtype(T[c])]
+    out = {}
+    for c in num_cols:
+        if _cr_kind(c) != "比率":
+            out[c] = _f(T[c]).groupby(key).sum()
+        elif c == "AOV":
+            out[c] = _f(T[gmvc]).groupby(key).sum() / _f(T[ordc]).groupby(key).sum().replace(0, np.nan)
+        elif c == "CTOR":
+            clicks = _f(T[clkc]) if clkc else _f(T["CTR"]) / 100 * _f(T["Product impressions"])
+            out[c] = _f(T[ordc]).groupby(key).sum() / clicks.groupby(key).sum().replace(0, np.nan) * 100
+        else:
+            wt = _f(T[wmap.get(c, wdef)])
+            out[c] = (_f(T[c]) * wt).groupby(key).sum() / wt.groupby(key).sum().replace(0, np.nan)
+    g = pd.DataFrame(out)
+    sell = _f(T[sellc]) > 0
+    g[f"表里出现的{noun}数"] = T.groupby(key)[idc].nunique()
+    g[f"出单{noun}数"] = T[sell].groupby(key[sell])[idc].nunique().reindex(g.index, fill_value=0)
+    return g
+
+
 def build_creator_base(cd: dict) -> dict:
     """达人组四张表 → 分析用的全部结构（只依赖达人数据本身；按链接的渠道 GMV 另外用运营数据校准）。"""
     out = {}
@@ -1856,49 +1920,23 @@ def build_creator_base(cd: dict) -> dict:
             "完播率%": np.nan, "发布时间": L["LIVE start time"].astype(str).values}))
     out["content"] = pd.concat(cont, ignore_index=True) if cont else pd.DataFrame()
 
-    # ⑦ 全量逐日表：三张原始表（达人/视频/直播）的每一个数值字段按天汇总——可加的求和，
-    #    比率/均值按对应的量加权（例如完播率按播放加权、CTR 按曝光加权），客单价/CTOR 用合计重算
+    # ⑦ 全量逐日表：三张原始表（达人/视频/直播）的每一个数值字段按天汇总（链接表的字段在 link 里已有，只补去重数）
     dt = []
-    spec = {
-        "达人表": (C, "Creator name", "Attributed orders", "达人", "Creator-attributed GMV", "Attributed orders",
-                  None, {"CTR": "Product impressions"}, "Product impressions"),
-        "视频表": (V, "Video ID", "Creator video-attributed GMV", "视频", "Creator video-attributed GMV",
-                  "Video-attributed orders", "Video product clicks",
-                  {"CTR": "Video product impressions", "Avg. GMV per customer": "Video-attributed orders"},
-                  "Video views"),
-        "直播表": (L, "LIVE ID", "Creator LIVE-attributed GMV", "直播", "Creator LIVE-attributed GMV",
-                  "LIVE-attributed orders", "Product clicks",
-                  {"CTR": "LIVE product impressions", "Tap-through rate": "Impressions", "Show GPM": "Impressions",
-                   "Avg. GMV per customer": "LIVE-attributed orders"}, "LIVE product viewers"),
-    }
-    for tname, (T, idc, sellc, noun, gmvc, ordc, clkc, wmap, wdef) in spec.items():
-        if not len(T):
-            continue
-        num_cols = [c for c in T.columns if c not in _CREATOR_NONMETRIC and c != "日期"
-                    and pd.api.types.is_numeric_dtype(T[c])]
-        sums = [c for c in num_cols if _cr_kind(c) != "比率"]
-        g = T.groupby("日期")[sums].sum().astype(float)
-        day = T["日期"]
-        for c in (x for x in num_cols if _cr_kind(x) == "比率"):
-            if c == "AOV":
-                v = _f(T[gmvc]).groupby(day).sum() / _f(T[ordc]).groupby(day).sum().replace(0, np.nan)
-            elif c == "CTOR":
-                clicks = (_f(T[clkc]) if clkc else _f(T["CTR"]) / 100 * _f(T["Product impressions"]))
-                v = _f(T[ordc]).groupby(day).sum() / clicks.groupby(day).sum().replace(0, np.nan) * 100
-            else:
-                wt = _f(T[wmap.get(c, wdef)])
-                v = (_f(T[c]) * wt).groupby(day).sum() / wt.groupby(day).sum().replace(0, np.nan)
-            g[c] = v
-        g.columns = [f"{tname}::{c}" for c in g.columns]
-        g[f"{tname}::表里出现的{noun}数"] = T.groupby("日期")[idc].nunique()
-        g[f"{tname}::出单{noun}数"] = T[_f(T[sellc]) > 0].groupby("日期")[idc].nunique()
-        dt.append(g)
+    for tname, T in (("Creators", C), ("Videos", V), ("LIVE", L)):
+        if len(T):
+            g = cr_agg(T, tname, T["日期"])
+            g.columns = [f"{CR_TABLES[tname][0]}::{c}" for c in g.columns]
+            dt.append(g)
     if len(P):
-        g = pd.DataFrame({"链接表::有达人活动的链接数": P.groupby("日期")["Product ID"].nunique(),
-                          "链接表::出单链接数": P[_f(P["Creator-attributed GMV"]) > 0].groupby("日期")["Product ID"].nunique()})
+        g = cr_agg(P, "Products", P["日期"])[["表里出现的链接数", "出单链接数"]]
+        g.columns = [f"链接表::{c}" for c in g.columns]
         dt.append(g)
-    daytot = pd.concat(dt, axis=1).fillna(0.0).reset_index() if dt else pd.DataFrame(columns=["日期"])
-    out["daytot"] = daytot
+    out["daytot"] = pd.concat(dt, axis=1).fillna(0.0).rename_axis("日期").reset_index() if dt \
+        else pd.DataFrame(columns=["日期"])
+    # ⑧ 原始逐日表 + 他们另外上传的「月数据」Excel（逐日 / 逐周 / 逐月 / 自选区间对比页用）
+    out["raw"] = {k: T for k, T in (("Creators", C), ("Products", P), ("Videos", V), ("LIVE", L)) if len(T)}
+    out["raw_monthly"] = {k: cd[k][cd[k]["_gran"] == "monthly"].copy() for k in cd
+                          if (cd[k]["_gran"] == "monthly").any()}
     return out
 
 
@@ -2241,7 +2279,8 @@ def page_overview():
                ("chain", "大跌之后有没有回暖，逐日追踪", "📉"),
                ("effect", "你改过的链接，改完有没有用", "🧪")])
     if PROF["key"] == "cr":
-        _nav_cards([("rank", "谁在卖、哪条视频/直播在卖：带环比和贡献度的排行", "🏆"),
+        _nav_cards([("granular", "四个 Excel 的每个字段：逐日 / 逐周 / 逐月 / 自选区间环比", "🗓️"),
+                    ("rank", "谁在卖、哪条视频/直播在卖：带环比和贡献度的排行", "🏆"),
                     ("drilldown", "任意一条链接：全指标趋势、占达人合计的比重、是哪些达人在推", "🔗")])
 
     st.markdown("---")
@@ -2276,21 +2315,15 @@ def page_overview():
 # ── 两段对比·归因 ──────────────────────────────────────────────────────
 def render_compare():
     st.subheader("两段时间对比：谁导致的、掉在哪个渠道、卡在哪一环")
-    st.caption("默认 = 数据里最近 7 天 vs 再往前 7 天（这一页不受左侧『分析区间』限制）。"
+    st.caption("默认 = 数据里最近 7 天 vs 再往前 7 天；改了本期，基期自动跟成本期前面同样天数的一段（可关掉自动、手动选）。"
+               "这一页不受左侧『分析区间』限制。"
                "所有 % 都是 **本期 vs 基期**；CTR / CTOR 这类比率的变化用 **百分点 pp**。")
     D = df_all
     d_first, d_last = D["日期"].min(), D["日期"].max()
-    c1, c2 = st.columns(2)
-    r_cur = c1.date_input("本期", value=((d_last - pd.Timedelta(days=6)).date(), d_last.date()),
-                          min_value=d_first.date(), max_value=d_last.date(), key="cmp_cur")
-    r_base = c2.date_input("基期（跟谁比）",
-                           value=((d_last - pd.Timedelta(days=13)).date(), (d_last - pd.Timedelta(days=7)).date()),
-                           min_value=d_first.date(), max_value=d_last.date(), key="cmp_base")
-    if not (isinstance(r_cur, tuple) and len(r_cur) == 2 and isinstance(r_base, tuple) and len(r_base) == 2):
-        st.info("请把本期和基期的起止日期都选完整。")
+    picked = _pick_two_periods(d_first, d_last, "cmp")
+    if picked is None:
         return
-    a0, a1 = pd.Timestamp(r_cur[0]), pd.Timestamp(r_cur[1])
-    b0, b1 = pd.Timestamp(r_base[0]), pd.Timestamp(r_base[1])
+    a0, a1, b0, b1 = picked
     cm, bm = D["日期"].between(a0, a1), D["日期"].between(b0, b1)
     na, nb = D.loc[cm, "日期"].nunique(), D.loc[bm, "日期"].nunique()
     if not na or not nb:
@@ -2593,6 +2626,9 @@ def page_compare():
 
 # ── ③ 多粒度对比 ──────────────────────────────────────────────────────
 def page_granular():
+    if PROF["key"] == "cr":
+        page_granular_creator()
+        return
     st.subheader("日 / 周 / 月 / 季 —— 环比对比")
     gran = st.radio("粒度", PROF["periods"], horizontal=True, index=1)
     agg = aggregate(df, gran)
@@ -3715,6 +3751,383 @@ def render_creator_link_extras(pid: str, sub: pd.DataFrame, gran: str):
     st.dataframe(round_num(tc.reset_index(), 0), hide_index=True)
 
 
+# ── 通用：本期自己选，基期默认自动 = 紧挨着本期前面、同样天数的一段 ──────────
+def _pick_two_periods(d_first: pd.Timestamp, d_last: pd.Timestamp, key: str):
+    """返回 (a0, a1, b0, b1)；没选完整返回 None。控件 key 按数据源区分（两边日期范围不同）。"""
+    c1, c2 = st.columns(2)
+    r_cur = c1.date_input("本期", value=((d_last - pd.Timedelta(days=6)).date(), d_last.date()),
+                          min_value=d_first.date(), max_value=d_last.date(), key=f"{key}_cur_{PROF['key']}")
+    auto = c2.toggle("基期自动 = 本期前面同样天数", value=True, key=f"{key}_auto_{PROF['key']}")
+    if not (isinstance(r_cur, tuple) and len(r_cur) == 2):
+        st.info("请把本期的起止日期选完整。")
+        return None
+    a0, a1 = pd.Timestamp(r_cur[0]), pd.Timestamp(r_cur[1])
+    if auto:
+        n = (a1 - a0).days + 1
+        b1 = a0 - pd.Timedelta(days=1)
+        b0 = b1 - pd.Timedelta(days=n - 1)
+        c2.markdown(f"基期（跟谁比）：**{b0:%Y/%m/%d} – {b1:%Y/%m/%d}**，紧挨着本期、同样 {n} 天")
+        if b0 < d_first:
+            c2.caption(f"⚠️ 基期有一部分早于数据开始日 {d_first:%m/%d}，只用有数据的那几天（按天数折算）")
+        return a0, a1, b0, b1
+    r_base = c2.date_input("基期（跟谁比）",
+                           value=((d_last - pd.Timedelta(days=13)).date(), (d_last - pd.Timedelta(days=7)).date()),
+                           min_value=d_first.date(), max_value=d_last.date(), key=f"{key}_base_{PROF['key']}")
+    if not (isinstance(r_base, tuple) and len(r_base) == 2):
+        st.info("请把基期的起止日期选完整。")
+        return None
+    return a0, a1, pd.Timestamp(r_base[0]), pd.Timestamp(r_base[1])
+
+
+# ── 达人版「多粒度对比」：四个 Excel 的全部字段，逐日 / 逐周 / 逐月 / 自选区间 ──
+_WEEKDAY = "一二三四五六日"
+_CR_LINK_CUM = {"Videos", "LIVE streams", "Creators posted content", "Creators with sales", "Videos with sales",
+                "LIVE streams with sales"}
+_CR_MONEY_AVG = {"AOV", "Avg. GMV per customer", "Video GPM", "Show GPM"}
+
+
+def _cr_plabel(p: pd.Timestamp, gran: str, days=None) -> str:
+    if gran == "日":
+        return f"{p:%m-%d}（周{_WEEKDAY[p.weekday()]}）"
+    if gran == "周":
+        return f"{p:%m-%d}~{p + pd.Timedelta(days=6):%m-%d}" + (f"（{int(days)}天）" if days and days < 7 else "")
+    full = (p + pd.offsets.MonthEnd(0)).day
+    return f"{p:%Y-%m}" + (f"（{int(days)}天）" if days and days < full else "")
+
+
+def _cr_is_pct(field: str, t: str | None = None) -> bool:
+    """LIVE 表的 Engagement 是 TikTok 自己的互动指数（原始值 200+），不是百分比。"""
+    return field in CR_PCT_FIELDS and not (t == "LIVE" and field == "Engagement")
+
+
+def _cr_is_level(field: str) -> bool:
+    """不能按天数摊的字段：比率/均值、去重个数。"""
+    return _cr_kind(field) == "比率" or field.startswith(("表里出现的", "出单"))
+
+
+def _cr_is_money(field: str) -> bool:
+    return field in _CR_MONEY_AVG or (_cr_kind(field) == "金额" and field not in CR_PCT_FIELDS)
+
+
+def _cr_fmt(field: str, v, avg: bool = False, t: str | None = None) -> str:
+    if pd.isna(v):
+        return "—"
+    if field in CR_PCT_FIELDS and not _cr_is_pct(field, t):
+        return f"{v:,.2f}"
+    if field in CR_PCT_FIELDS:
+        return f"{v:.2f}%"
+    if field == "Avg. viewing duration":
+        return f"{v:,.1f} 秒"
+    if _cr_is_money(field):
+        return f"${v:,.2f}"
+    return f"{v:,.1f}" if avg and not _cr_is_level(field) else f"{v:,.0f}"
+
+
+def _cr_delta(field: str, cur, prev, t: str | None = None) -> tuple[str, float]:
+    """(变化的文字, 环比%)。百分比字段的变化用 pp。"""
+    if pd.isna(cur) or pd.isna(prev):
+        return "—", np.nan
+    d = cur - prev
+    rel = (cur / prev - 1) * 100 if prev else np.nan
+    if field in CR_PCT_FIELDS and not _cr_is_pct(field, t):
+        return f"{d:+,.2f}", rel
+    if field in CR_PCT_FIELDS:
+        return f"{d:+.2f} pp", rel
+    if field == "Avg. viewing duration":
+        return f"{d:+.1f} 秒", rel
+    if _cr_is_money(field):
+        return ("+" if d >= 0 else "-") + f"${abs(d):,.2f}", rel
+    return (f"{d:+,.1f}" if d != round(d) else f"{d:+,.0f}"), rel
+
+
+def _cr_cn(tname: str, field: str, gran: str) -> str:
+    if field.startswith(("表里出现的", "出单")):
+        return "当天去重" if gran == "日" else "这一期里去重"
+    if tname == "LIVE" and field == "Engagement":
+        return "互动指数（TikTok 原始口径，不是百分比）"
+    cn = CR_FIELD_CN.get(field, field)
+    return cn + ("（按链接累计）" if tname == "Products" and field in _CR_LINK_CUM else "")
+
+
+def _cr_header(field: str) -> str:
+    return field if field.startswith(("表里出现的", "出单")) else f"{CR_FIELD_CN.get(field, field)}｜{field}"
+
+
+def _color_css(v) -> str:
+    if pd.isna(v) or abs(v) < 0.05:
+        return ""
+    return "color: #2E9E7A; font-weight: 600" if v > 0 else "color: #D9534F; font-weight: 600"
+
+
+def _style_rows(disp: pd.DataFrame, rel: pd.Series, cols) -> "pd.io.formats.style.Styler":
+    css = pd.DataFrame("", index=disp.index, columns=disp.columns)
+    for c in cols:
+        css[c] = [_color_css(v) for v in rel.values]
+    return disp.style.apply(lambda _: css, axis=None)
+
+
+def cr_period_table(tname: str, gran: str) -> pd.DataFrame:
+    """行 = 期间，列 = 天数、来源 + 这张 Excel 的全部字段（合计口径）。
+    逐月时，已经过完的月份如果有他们上传的「月数据」Excel 就直接用它（逐日数据 7/31 才开始，靠它才有完整的 6、7 月）。"""
+    memo = st.session_state.setdefault("_crg_memo", {})
+    mk = (id(CRB), tname, gran)
+    if mk in memo:
+        return memo[mk]
+    T = CRB["raw"][tname]
+    key = to_period(T["日期"], gran)
+    g = cr_agg(T, tname, key)
+    g.insert(0, "天数", T.groupby(key)["日期"].nunique().reindex(g.index).astype(int))
+    g.insert(1, "来源", "逐日汇总")
+    if gran == "月" and tname in CRB["raw_monthly"]:
+        last = T["日期"].max()
+        for m, Tm in CRB["raw_monthly"][tname].groupby("_month"):
+            start = pd.Timestamp(year=last.year, month=int(m), day=1)
+            end = start + pd.offsets.MonthEnd(0)
+            if end >= last:                                  # 还没过完的月份用逐日汇总
+                continue
+            gm = cr_agg(Tm, tname, pd.Series(start, index=Tm.index))
+            gm.insert(0, "天数", end.day)
+            gm.insert(1, "来源", "月数据 Excel")
+            g = pd.concat([g.drop(index=start, errors="ignore"), gm])
+    g = g.sort_index()
+    memo[mk] = g
+    return g
+
+
+def cr_window_table(tname: str, a0, a1, b0, b1) -> pd.DataFrame:
+    """自选区间：本期 / 上一段 两行，列 = 天数 + 全部字段（合计口径）。"""
+    T = CRB["raw"][tname]
+    lab = np.where(T["日期"].between(a0, a1), "本期", np.where(T["日期"].between(b0, b1), "上一段", ""))
+    m = lab != ""
+    Tm = T[m]
+    if Tm.empty:
+        return pd.DataFrame(index=["上一段", "本期"])
+    key = pd.Series(lab[m], index=Tm.index)
+    g = cr_agg(Tm, tname, key)
+    g.insert(0, "天数", Tm.groupby(key)["日期"].nunique())
+    return g.reindex(["上一段", "本期"])
+
+
+def cr_compare_frame(tname: str, cur: pd.Series, prev: pd.Series, avg: bool, gran: str) -> pd.DataFrame:
+    """一张 Excel 的全部字段：上一期 / 本期 / 变化 / 环比%（字段 = 行，顺序同 Excel）。"""
+    dc = cur.get("天数") if pd.notna(cur.get("天数")) and cur.get("天数") else np.nan
+    dp = prev.get("天数") if pd.notna(prev.get("天数")) and prev.get("天数") else np.nan
+    rows = []
+    for f in [c for c in cur.index if c not in ("天数", "来源")]:
+        c, p = cur[f], prev[f]
+        if avg and not _cr_is_level(f):
+            c, p = c / dc, p / dp
+        txt, rel = _cr_delta(f, c, p, tname)
+        rows.append({"字段": f, "说明": _cr_cn(tname, f, gran), "上一期": _cr_fmt(f, p, avg, tname),
+                     "本期": _cr_fmt(f, c, avg, tname), "变化": txt, "环比%": "—" if pd.isna(rel) else f"{rel:+.1f}%",
+                     "_rel": rel, "_prev": p})
+    return pd.DataFrame(rows)
+
+
+def _cr_movers(frames: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """四张表合看：金额 / 计数类字段里环比变化最大的（基数太小的不算：计数 < 5、金额 < $20；
+    比率类字段样本小时波动很大，放在下面各表里看，不进这张榜）。"""
+    parts = []
+    for t, cf in frames.items():
+        x = cf.copy()
+        x.insert(0, "表", t)
+        parts.append(x)
+    if not parts:
+        return pd.DataFrame(), pd.DataFrame()
+    a = pd.concat(parts, ignore_index=True)
+    a = a[~a["字段"].map(_cr_is_level)]
+    floor = a["字段"].map(lambda f: 20 if _cr_is_money(f) else 5)
+    a = a[a["_rel"].notna() & (a["_prev"].abs() >= floor)]
+    a = a.drop_duplicates(["字段", "上一期", "本期"])
+    cols = ["表", "字段", "说明", "上一期", "本期", "环比%"]
+    up = a[a["_rel"] >= 5].sort_values("_rel", ascending=False).head(8)
+    down = a[a["_rel"] <= -5].sort_values("_rel").head(8)
+    return up[cols + ["_rel"]], down[cols + ["_rel"]]
+
+
+def _cr_matrix(t: str, g: pd.DataFrame, gran: str, avg: bool):
+    """每一期 × 全部字段（最新在上），可切换 数值 / 环比。"""
+    fields = [c for c in g.columns if c not in ("天数", "来源")]
+    val = g[fields].astype(float).copy()
+    if avg:
+        for f in fields:
+            if not _cr_is_level(f):
+                val[f] = val[f] / g["天数"]
+    rel = pd.DataFrame({f: (val[f].diff() if _cr_is_pct(f, t) else val[f].pct_change(fill_method=None) * 100)
+                        for f in fields}).replace([np.inf, -np.inf], np.nan)
+    view = st.radio("显示", ["数值", "环比（vs 上一期）"], horizontal=True, key=f"crg_view_{t}")
+    if view == "数值":
+        body = pd.DataFrame({_cr_header(f): [_cr_fmt(f, v, avg, t) for v in val[f]] for f in fields}, index=g.index)
+        css = None
+    else:
+        body = pd.DataFrame({_cr_header(f): ["—" if pd.isna(v) else (f"{v:+.2f} pp" if _cr_is_pct(f, t) else f"{v:+.1f}%")
+                                             for v in rel[f]] for f in fields}, index=g.index)
+        css = pd.DataFrame({_cr_header(f): [_color_css(v) for v in rel[f]] for f in fields}, index=g.index)
+    lead = pd.DataFrame({"期间": [_cr_plabel(p, gran, d) for p, d in zip(g.index, g["天数"])],
+                         "天数": g["天数"].astype(int).values}, index=g.index)
+    if gran == "月":
+        lead["来源"] = g["来源"].values
+    disp = pd.concat([lead, body], axis=1).iloc[::-1]
+    if css is not None:
+        css = pd.concat([pd.DataFrame("", index=lead.index, columns=lead.columns), css], axis=1).iloc[::-1]
+        st.dataframe(disp.style.apply(lambda _: css, axis=None), hide_index=True, height=420)
+    else:
+        st.dataframe(disp, hide_index=True, height=420)
+    out = lead.copy()
+    for f in fields:
+        out[f] = val[f].round(4)
+        out[f"{f}｜环比{'pp' if _cr_is_pct(f, t) else '%'}"] = rel[f].round(2)
+    st.download_button(f"⬇️ 下载 {t} 每期全部字段 + 环比 CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                       f"达人组_{t}_{gran}{'_日均' if avg else '_合计'}.csv", "text/csv", key=f"crg_dl_{t}")
+
+
+def _cr_field_trend(t: str, fields: list, gran: str | None, avg: bool, g: pd.DataFrame | None, win=None):
+    """单个字段的走势：逐日/周/月 = 每期数值 + 环比；自选区间 = 两段的逐日走势。"""
+    f = st.selectbox("看某一个字段的走势", fields, key=f"crg_field_{t}",
+                     format_func=lambda x: x if x.startswith(("表里出现的", "出单")) else f"{CR_FIELD_CN.get(x, x)}（{x}）")
+    if gran:
+        v = g[f].astype(float)
+        if avg and not _cr_is_level(f):
+            v = v / g["天数"]
+        r = v.diff() if _cr_is_pct(f, t) else v.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan) * 100
+        # 逐日用真实日期轴（缺的天会留空，不会被挤掉）；周 / 月用期间标签
+        x = list(g.index) if gran == "日" else [_cr_plabel(p, gran, d) for p, d in zip(g.index, g["天数"])]
+        a_, b_ = st.columns([3, 2])
+        fv = go.Figure(go.Bar(x=x, y=v, marker_color="#C2416B"))
+        fv.update_layout(height=300, margin=dict(t=30, b=10),
+                         title=f"{CR_FIELD_CN.get(f, f)}{'（日均）' if avg and not _cr_is_level(f) else ''}")
+        a_.plotly_chart(fv, key=f"crg_v_{t}")
+        fr = go.Figure(go.Bar(x=x, y=r, marker_color=["#2E9E7A" if (pd.notna(z) and z >= 0) else "#D9534F" for z in r]))
+        fr.add_hline(y=0, line_color="#8A727C")
+        fr.update_layout(height=300, margin=dict(t=30, b=10),
+                         title=f"环比（vs 上一期，{'pp' if _cr_is_pct(f, t) else '%'}）")
+        b_.plotly_chart(fr, key=f"crg_r_{t}")
+        return
+    a0, a1, b0, b1 = win
+    T = CRB["raw"][t]
+    T = T[T["日期"].between(b0, a1)]
+    if T.empty:
+        st.caption("这两段里没有数据。")
+        return
+    s = cr_agg(T, t, T["日期"])[f]
+    fig = go.Figure(go.Scatter(x=s.index, y=s.values, mode="lines+markers", line=dict(color="#C2416B", width=2)))
+    for x0, x1, nm in ((b0, b1, "上一段"), (a0, a1, "本期")):
+        fig.add_vrect(x0=x0 - pd.Timedelta(hours=12), x1=x1 + pd.Timedelta(hours=12), fillcolor="#8A727C",
+                      opacity=.08 if nm == "上一段" else .16, line_width=0, annotation_text=nm,
+                      annotation_position="top left")
+    fig.update_layout(height=320, margin=dict(t=30, b=10), hovermode="x unified",
+                      title=f"{CR_FIELD_CN.get(f, f)}：两段的逐日走势")
+    st.plotly_chart(fig, key=f"crg_w_{t}")
+
+
+def page_granular_creator():
+    st.subheader("逐日 / 逐周 / 逐月 / 自选区间对比：达人组每个 Excel 的全部字段")
+    st.caption("数据 = 达人组上传的 Creators / Products / Videos / LIVE 四个 Excel（Creators 另有每月的「月数据」Excel）。"
+               "每个字段按期加总；比率/均值字段（CTR、完播率、互动率、客单价…）按曝光、播放、观众加权重算，不是简单平均；"
+               "「表里出现的 / 出单 X 数」是这一期里的去重个数。环比 = 本期 vs 上一期。")
+    avail = [t for t in ("Creators", "Products", "Videos", "LIVE") if t in CRB["raw"]]
+    last_by = {t: CRB["raw"][t]["日期"].max() for t in avail}
+    common_last = min(last_by.values())
+    c1, c2, c3 = st.columns([1.7, 1.1, 2.2])
+    mode = c1.radio("对比方式", ["逐日", "逐周", "逐月", "自选区间"], horizontal=True, key="crg_mode")
+    gran = {"逐日": "日", "逐周": "周", "逐月": "月"}.get(mode)
+    if mode == "逐日":
+        avg = False
+        c2.caption("口径：当天数值")
+    else:
+        avg = c2.radio("口径", ["日均", "合计"], horizontal=True, index=0 if gran else 1,
+                       key=f"crg_avg_{mode}",
+                       help="周 / 月天数不同（首尾常常不满），默认按日均比；自选区间两段天数一样，默认按合计比。"
+                            "比率和去重个数两种口径下都一样。") == "日均"
+    unit_note = "（日均）" if avg else ""
+
+    frames, heads, tables, win = {}, {}, {}, None
+    if gran:
+        tables = {t: cr_period_table(t, gran) for t in avail}
+        periods = sorted(set().union(*[set(g.index) for g in tables.values()]), reverse=True)
+        common = sorted(set.intersection(*[set(g.index) for g in tables.values()]), reverse=True)
+        full = [p for p in common if gran != "周" or all(tables[t].at[p, "天数"] >= 7 for t in avail)]
+        default = full[0] if full else (common[0] if common else periods[0])
+        days_of = {}
+        for g in tables.values():
+            for p, d in g["天数"].items():
+                days_of[p] = max(days_of.get(p, 0), d)
+        pick = c3.selectbox("本期（跟它的上一期比）", periods, index=periods.index(default), key=f"crg_pick_{gran}",
+                            format_func=lambda p: _cr_plabel(p, gran, days_of.get(p)))
+        for t in avail:
+            g = tables[t]
+            if pick not in g.index:
+                heads[t] = f"这张表没有这一期的数据（最新到 {last_by[t]:%m-%d}）。"
+                continue
+            i = list(g.index).index(pick)
+            if i == 0:
+                heads[t] = "这是这张表的第一期，没有上一期可比。"
+                continue
+            cur, prev = g.iloc[i], g.iloc[i - 1]
+            heads[t] = (f"本期 **{_cr_plabel(g.index[i], gran, cur['天数'])}**（{cur['来源']}，{int(cur['天数'])} 天）"
+                        f" vs 上一期 **{_cr_plabel(g.index[i - 1], gran, prev['天数'])}**（{prev['来源']}，{int(prev['天数'])} 天）")
+            frames[t] = cr_compare_frame(t, cur, prev, avg, gran)
+    else:
+        d_first = min(CRB["raw"][t]["日期"].min() for t in avail)
+        rng = c3.date_input("本期（选一段日期，自动跟前面同样天数的一段比）",
+                            value=((common_last - pd.Timedelta(days=6)).date(), common_last.date()),
+                            min_value=d_first.date(), max_value=max(last_by.values()).date(), key="crg_rng")
+        if not (isinstance(rng, tuple) and len(rng) == 2):
+            st.info("请把本期的起止日期选完整。")
+            return
+        a0, a1 = pd.Timestamp(rng[0]), pd.Timestamp(rng[1])
+        n = (a1 - a0).days + 1
+        b1 = a0 - pd.Timedelta(days=1)
+        b0 = b1 - pd.Timedelta(days=n - 1)
+        win = (a0, a1, b0, b1)
+        st.markdown(f"本期 **{a0:%Y/%m/%d} – {a1:%m/%d}**（{n} 天） vs 上一段 **{b0:%Y/%m/%d} – {b1:%m/%d}**"
+                    f"（紧挨着本期、同样 {n} 天）")
+        for t in avail:
+            w = cr_window_table(t, a0, a1, b0, b1)
+            dc = int(w.at["本期", "天数"]) if "天数" in w and pd.notna(w.at["本期", "天数"]) else 0
+            db = int(w.at["上一段", "天数"]) if "天数" in w and pd.notna(w.at["上一段", "天数"]) else 0
+            if not dc or not db:
+                heads[t] = (f"这张表在{'本期' if not dc else '上一段'}没有数据（这张表的数据范围 "
+                            f"{CRB['raw'][t]['日期'].min():%m-%d} → {last_by[t]:%m-%d}）。")
+                continue
+            heads[t] = f"本期有数据 {dc}/{n} 天，上一段 {db}/{n} 天" + \
+                ("——⚠️ 两段有数据的天数不同，建议口径选「日均」" if dc != db and not avg else "")
+            frames[t] = cr_compare_frame(t, w.loc["本期"], w.loc["上一段"], avg, "区间")
+
+    if max(last_by.values()) > common_last:
+        st.caption("各表更新到的日期：" + "　".join(f"{t} {d:%m-%d}" for t, d in last_by.items()))
+
+    st.markdown(f"#### 变化最大的字段{unit_note}（四张表合看金额/计数类；环比 ≥ 5%，基数太小的不算；比率类见下面各表）")
+    up, down = _cr_movers(frames)
+    ca, cb = st.columns(2)
+    for cc, tb, ttl in ((ca, up, "上升最多"), (cb, down, "下降最多")):
+        cc.markdown(f"**{ttl}**")
+        if tb.empty:
+            cc.caption("没有。")
+        else:
+            cc.dataframe(_style_rows(tb.drop(columns="_rel"), tb["_rel"], ["环比%"]), hide_index=True)
+
+    tabs = st.tabs([f"{t} · {CR_TABLES[t][0]}" + (f"（{len(frames[t])} 个字段）" if t in frames else "") for t in avail])
+    for tab, t in zip(tabs, avail):
+        with tab:
+            st.markdown(heads.get(t, ""))
+            if t in frames:
+                cf = frames[t]
+                n_up, n_dn = int((cf["_rel"] >= 0.05).sum()), int((cf["_rel"] <= -0.05).sum())
+                st.caption(f"{n_up} 个字段上升、{n_dn} 个下降（绿 = 上升，红 = 下降，只表示方向——退款、佣金上升不是好事）。"
+                           + ("金额和计数是日均值。" if avg else ""))
+                disp = cf.drop(columns=["_rel", "_prev"])
+                st.dataframe(_style_rows(disp, cf["_rel"], ["变化", "环比%"]), hide_index=True,
+                             height=min(1000, 40 + 35 * len(disp)))
+            if gran:
+                st.markdown(f"**每一期 × 全部字段**{unit_note}（最新在上）")
+                _cr_matrix(t, tables[t], gran, avg)
+            fields = (frames[t]["字段"].tolist() if t in frames
+                      else [c for c in tables[t].columns if c not in ("天数", "来源")] if gran else [])
+            if fields:
+                _cr_field_trend(t, fields, gran, avg, tables.get(t), win)
+
+
 # ── 达人独有：达人 / 内容排行 ───────────────────────────────────────────
 RANK_DIMS = {
     "达人": ("达人", ["GMV", "订单", "件数", "曝光", "播放", "新发视频", "新开直播", "寄样", "样品内容", "加橱窗",
@@ -3733,21 +4146,17 @@ def page_rank():
                "每个达人 / 每条内容的 Δ 加起来 = 达人合计的变化，谁拉动、谁拖累一眼能看出来。")
     D = df_all
     d_first, d_last = D["日期"].min(), D["日期"].max()
-    c0, c1, c2, c3 = st.columns([1, 1.4, 1.4, 1.2])
-    dim = c0.radio("维度", list(RANK_DIMS), key="rk_dim")
-    r_cur = c1.date_input("本期", value=((d_last - pd.Timedelta(days=6)).date(), d_last.date()),
-                          min_value=d_first.date(), max_value=d_last.date(), key="rk_cur")
-    r_base = c2.date_input("基期（跟谁比）",
-                           value=((d_last - pd.Timedelta(days=13)).date(), (d_last - pd.Timedelta(days=7)).date()),
-                           min_value=d_first.date(), max_value=d_last.date(), key="rk_base")
+    c0, c3 = st.columns([2, 1])
+    dim = c0.radio("维度", list(RANK_DIMS), key="rk_dim", horizontal=True)
     key, mets = RANK_DIMS[dim]
     val = c3.selectbox("排序指标", mets, key=f"rk_val_{dim}")
-    if not (isinstance(r_cur, tuple) and len(r_cur) == 2 and isinstance(r_base, tuple) and len(r_base) == 2):
-        st.info("请把本期和基期的起止日期都选完整。")
+    picked = _pick_two_periods(d_first, d_last, "rk")
+    if picked is None:
         return
+    a0, a1, b0, b1 = picked
     avail = _ts_list(D["日期"].unique())
-    cd = [d for d in avail if r_cur[0] <= d.date() <= r_cur[1]]
-    bd = [d for d in avail if r_base[0] <= d.date() <= r_base[1]]
+    cd = [d for d in avail if a0 <= d <= a1]
+    bd = [d for d in avail if b0 <= d <= b1]
     if not cd or not bd:
         st.warning("所选区间里没有数据。")
         return
