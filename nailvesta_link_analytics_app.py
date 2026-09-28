@@ -22,8 +22,10 @@ NailVesta 链接数据深度分析 (Streamlit)
 """
 from __future__ import annotations
 
+import hashlib
 import html as _html
 import io
+import json
 import os
 import re
 import zipfile
@@ -265,32 +267,78 @@ def _read_one(buf, fname: str):
     return d, out, catalog
 
 
+PARSE_VER = "ops-v1"          # 改了 _read_one 的识别逻辑就把这个版本号 +1，旧的识别结果会自动作废、重新识别
+
+
+def _parse_dir() -> str:
+    return os.path.join(os.path.expanduser("~/nailvesta_lark_cache"), f"_parsed_{PARSE_VER}")
+
+
+def _read_one_cached(raw: bytes, name: str):
+    """
+    识别一个日报文件，结果按「文件内容指纹」存到磁盘：同一个文件第二次起直接读结果（0.00x 秒），
+    只有新增的、或者被重新上传改过内容的文件才真正去识别（每个约 0.2 秒）。
+    返回 (日期, 数据, 指标目录, 这次是不是新识别的)。
+    """
+    key = hashlib.sha1(raw).hexdigest()[:24]
+    pdir = _parse_dir()
+    meta_p, data_p = os.path.join(pdir, key + ".json"), os.path.join(pdir, key + ".parquet")
+    try:
+        if os.path.exists(meta_p):
+            with open(meta_p, encoding="utf-8") as fh:
+                meta = json.load(fh)
+            if meta.get("skip"):
+                return None, None, None, False
+            if os.path.exists(data_p):
+                return pd.Timestamp(meta["date"]), pd.read_parquet(data_p), meta.get("catalog"), False
+    except Exception:                               # noqa: BLE001  缓存坏了就当没有，重新识别
+        pass
+    d, df, cat = _read_one(io.BytesIO(raw), name)
+    try:
+        os.makedirs(pdir, exist_ok=True)
+        if df is not None:
+            df.to_parquet(data_p, index=False)
+        with open(meta_p, "w", encoding="utf-8") as fh:
+            json.dump({"name": name, "skip": df is None, "date": str(d.date()) if d is not None else None,
+                       "catalog": cat}, fh, ensure_ascii=False, default=str)
+    except Exception:                               # noqa: BLE001  写不了缓存不影响这次结果
+        pass
+    return d, df, cat, True
+
+
 @st.cache_data(show_spinner=False)
 def load_files(payloads: list[tuple[str, bytes]]):
-    """payloads: [(filename, bytes)] -> (long_df, catalog_df, log)"""
+    """payloads: [(filename, bytes)] -> (long_df, catalog_df, log, stats)"""
     frames, catalog, log = [], None, []
-    prog = st.progress(0.0, text="解析中…")
+    t0 = __import__("time").time()
+    n_new = n_skip = 0
+    prog = st.progress(0.0, text="读取中…")
     for i, (name, raw) in enumerate(payloads):
         try:
-            d, df, cat = _read_one(io.BytesIO(raw), name)
+            d, df, cat, fresh = _read_one_cached(raw, name)
+            n_new += fresh
             if df is None:
+                n_skip += 1
                 log.append(f"跳过（无法识别日期/内容）：{name}")
             else:
                 frames.append(df)
                 if catalog is None and cat:
                     catalog = pd.DataFrame(cat)
-                log.append(f"✓ {d.date()}  {name}  ({len(df)} 链接)")
+                log.append(f"{'✓ 新识别' if fresh else '· 已识别'} {d.date()}  {name}  ({len(df)} 链接)")
         except Exception as e:                      # noqa: BLE001
             log.append(f"✗ {name}: {e}")
-        prog.progress((i + 1) / max(len(payloads), 1), text=f"解析中… {i+1}/{len(payloads)}")
+        prog.progress((i + 1) / max(len(payloads), 1),
+                      text=f"读取中… {i+1}/{len(payloads)}（新识别 {n_new} 个）")
     prog.empty()
+    stats = {"files": len(payloads), "new": n_new, "cached": len(payloads) - n_new, "skipped": n_skip,
+             "secs": __import__("time").time() - t0}
     if not frames:
-        return pd.DataFrame(), pd.DataFrame(), log
+        return pd.DataFrame(), pd.DataFrame(), log, stats
 
     df = pd.concat(frames, ignore_index=True)
     df = df.drop_duplicates(subset=["日期", "product_id"], keep="last")
     df = df.sort_values(["日期", "product_id"]).reset_index(drop=True)
-    return df, (catalog if catalog is not None else pd.DataFrame()), log
+    return df, (catalog if catalog is not None else pd.DataFrame()), log, stats
 
 
 def gather_from_folder(folder: str):
@@ -352,7 +400,7 @@ def _lark_api(host, path, token=None, method="GET", retries: int = 4, **kw):
     for attempt in range(retries + 1):
         try:
             r = requests.request(method, f"{host}/open-apis{path}", headers=h, timeout=60, **kw)
-            if r.status_code >= 500 and attempt < retries:
+            if (r.status_code >= 500 or r.status_code == 429) and attempt < retries:     # 5xx / 限流：等一下再试
                 time.sleep(2 ** attempt)
                 continue
             return r
@@ -361,6 +409,45 @@ def _lark_api(host, path, token=None, method="GET", retries: int = 4, **kw):
             if attempt < retries:
                 time.sleep(2 ** attempt)
     raise NetworkError(f"连不上 Lark 服务器（已自动重试 {retries} 次）：{type(last).__name__}") from last
+
+
+def _lark_fetch_media(host, token, ftok, local, min_size: int = 500):
+    """下载一个附件到 local（先写 .part 再改名，下载一半断掉不会留下坏文件）。成功返回 None，失败返回原因。
+    在线程里跑，不能碰 st.*。"""
+    try:
+        r = _lark_api(host, f"/drive/v1/medias/{ftok}/download", token=token)
+        if r.status_code == 200 and len(r.content) > min_size:
+            tmp = local + ".part"
+            with open(tmp, "wb") as fh:
+                fh.write(r.content)
+            os.replace(tmp, local)
+            return None
+        try:
+            j = r.json()
+            return f"{j.get('code')} {j.get('msg')}"
+        except Exception:                                   # noqa: BLE001
+            return f"HTTP {r.status_code}"
+    except NetworkError as e:
+        return str(e)
+
+
+def _lark_fetch_many(host, token, jobs, label: str, min_size: int = 500, workers: int = 6) -> dict:
+    """jobs = [(显示名, file_token, 本地路径)]，几个一起下：Lark 单个附件下载要 3–6 秒，一个一个下几百个文件太慢。
+    返回 {显示名: 失败原因}。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    fails: dict = {}
+    if not jobs:
+        return fails
+    prog = st.progress(0.0, text=f"{label}… 0/{len(jobs)}")
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_lark_fetch_media, host, token, ft, lp, min_size): nm for nm, ft, lp in jobs}
+        for i, f in enumerate(as_completed(futs)):
+            err = f.result()
+            if err:
+                fails[futs[f]] = err
+            prog.progress((i + 1) / len(jobs), text=f"{label}… {i + 1}/{len(jobs)}")
+    prog.empty()
+    return fails
 
 
 @st.cache_data(ttl=5400, show_spinner=False)
@@ -421,31 +508,20 @@ def lark_download_attachments(host, app_id, app_secret, base_url, cache_dir, att
                         todo.append((a["name"], a["file_token"]))
     todo = list({t[1]: t for t in todo}.values())          # 按 token 去重
 
-    failed = []
-    prog = st.progress(0.0, text=f"从 Base 下载附件… 0/{len(todo)}")
-    for i, (name, ftok) in enumerate(todo):
-        local = os.path.join(cache_dir, f"{ftok[:8]}_{name}")
-        if os.path.exists(local) and os.path.getsize(local) > 1000:
-            with open(local, "rb") as fh:
+    local_of = {ftok: os.path.join(cache_dir, f"{ftok[:8]}_{name}") for name, ftok in todo}
+    need = [(name, ftok, local_of[ftok]) for name, ftok in todo
+            if not (os.path.exists(local_of[ftok]) and os.path.getsize(local_of[ftok]) > 1000)]
+    fails = _lark_fetch_many(host, token, need, f"从 Base 下载新增附件（共 {len(todo)} 个，缺 {len(need)} 个）",
+                             min_size=1000)
+    failed = [f"{nm} → {err}" for nm, err in fails.items()]
+    n_new = len(need) - len(fails)
+    for name, ftok in todo:
+        lp = local_of[ftok]
+        if os.path.exists(lp) and os.path.getsize(lp) > 1000:
+            with open(lp, "rb") as fh:
                 files.append((name, fh.read()))
-        else:
-            try:
-                r = _lark_api(host, f"/drive/v1/medias/{ftok}/download", token=token)
-                if r.status_code == 200 and len(r.content) > 1000:
-                    with open(local, "wb") as fh:
-                        fh.write(r.content)
-                    files.append((name, r.content))
-                else:
-                    try:
-                        j = r.json()
-                        failed.append(f"{name} → {j.get('code')} {j.get('msg')}")
-                    except Exception:                       # noqa: BLE001
-                        failed.append(f"{name} → HTTP {r.status_code}")
-            except Exception as e:                          # noqa: BLE001
-                failed.append(f"{name} → {type(e).__name__}")
-        prog.progress((i + 1) / max(len(todo), 1), text=f"从 Base 下载附件… {i+1}/{len(todo)}")
-    prog.empty()
     st.session_state["_lark_failed"] = failed               # 失败清单交给界面展示，绝不静默丢
+    st.session_state["_lark_new"] = n_new
     return files
 
 
@@ -596,7 +672,6 @@ def _creator_clean_df(raw: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def lark_creator_fetch_all(host, app_id, app_secret, url, cache_dir):
     """
     达人组数据总入口：解析 wiki 链接 → 扫描 4 个月份子表的附件网格 → 下载（本地有缓存就跳过）→
@@ -614,8 +689,14 @@ def lark_creator_fetch_all(host, app_id, app_secret, url, cache_dir):
         raise RuntimeError("扫描完了但一个附件都没找到——检查一下表格结构是不是变了。")
 
     frames = {sec: [] for sec in set(CREATOR_COL_SECTION.values())}
-    failed = []
-    prog = st.progress(0.0, text=f"下载达人组数据… 0/{len(cells)}")
+    need = []
+    for c in cells:
+        local = os.path.join(cache_dir, f"{c['file_token'][:10]}.xlsx")
+        if not os.path.exists(local + ".parquet") and not (os.path.exists(local) and os.path.getsize(local) > 500):
+            need.append((f"{c['month']} {c['label']} {c['section']}（{c['name']}）", c["file_token"], local))
+    dl_fail = _lark_fetch_many(host, token, need, f"下载达人组新增附件（共 {len(cells)} 个，缺 {len(need)} 个）")
+    failed, n_new = [f"{nm} → {err}" for nm, err in dl_fail.items()], 0
+    prog = st.progress(0.0, text=f"检查达人组数据… 0/{len(cells)}")
     for i, c in enumerate(cells):
         date, gran = _creator_cell_date(c["month"], c["label"])
         local = os.path.join(cache_dir, f"{c['file_token'][:10]}.xlsx")
@@ -626,13 +707,9 @@ def lark_creator_fetch_all(host, app_id, app_secret, url, cache_dir):
                 frames[c["section"]].append(raw)
                 continue
             if not (os.path.exists(local) and os.path.getsize(local) > 500):
-                r = _lark_api(host, f"/drive/v1/medias/{c['file_token']}/download", token=token)
-                if r.status_code != 200 or len(r.content) <= 500:
-                    failed.append(f"{c['month']} {c['label']} {c['section']}（{c['name']}）")
-                    continue
-                with open(local, "wb") as fh:
-                    fh.write(r.content)
+                continue                                          # 下载失败的已经记在 failed 里
             raw = pd.read_excel(local, header=0, skiprows=[1]).dropna(how="all")
+            n_new += 1
             if raw.empty:
                 continue
             raw = _creator_clean_df(raw)
@@ -647,14 +724,34 @@ def lark_creator_fetch_all(host, app_id, app_secret, url, cache_dir):
             frames[c["section"]].append(raw)
         except Exception as e:                                    # noqa: BLE001
             failed.append(f"{c['month']} {c['label']} {c['section']} → {type(e).__name__}: {e}")
-        prog.progress((i + 1) / len(cells), text=f"下载/解析达人组数据… {i+1}/{len(cells)}")
+        prog.progress((i + 1) / len(cells), text=f"检查达人组数据… {i+1}/{len(cells)}（新识别 {n_new} 个）")
     prog.empty()
 
     out = {}
     for sec, fl in frames.items():
         if fl:
-            out[sec] = pd.concat(fl, ignore_index=True, sort=False)
-    return out, cells, failed
+            out[sec] = _creator_slim(pd.concat(fl, ignore_index=True, sort=False))
+    return out, cells, failed, {"new": n_new, "checked": pd.Timestamp.now()}
+
+
+_CR_DROP_COLS = ("_src_file", "Video link")                  # 程序里没用到的长文本，451 个附件时约占 95MB
+_CR_CAT_COLS = ("Video title", "Post date", "LIVE title", "LIVE start time", "LIVE end time",
+                "Product name", "Product category")         # 同一条视频每天一行、标题重复几十次 → 分类存储只存一份
+
+
+def _creator_slim(t: pd.DataFrame) -> pd.DataFrame:
+    """
+    达人组原始表瘦身（Streamlit Cloud 内存有上限，达人附件到 451 个时原始表约 520MB，超了就「Oh no」）：
+    去掉没用到的长文本列、日期从文字转成真正的日期、重复很多的文字列用分类存储。数值一个都不动。
+    分类列都不拿来 groupby（pandas 2.x 对分类列 groupby 会把所有类别两两组合），只用来显示。
+    """
+    t = t.drop(columns=[c for c in _CR_DROP_COLS if c in t.columns])
+    if "_date" in t.columns:
+        t["_date"] = pd.to_datetime(t["_date"], errors="coerce")
+    for c in _CR_CAT_COLS:
+        if c in t.columns:
+            t[c] = t[c].astype("category")
+    return t
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1406,7 +1503,8 @@ if mode == "飞书 Base 直连":
         except Exception as e:                              # noqa: BLE001
             st.sidebar.error(f"保存失败：{e}")
 
-    if st.sidebar.button("② 🔄 从 Base 拉取全部", type="primary"):
+    def _pull_ops(auto: bool = False) -> bool:
+        """从 Base 拉日报：本地已有的附件不重下，只下新增的；识别也只识别新增的（见 load_files）。"""
         for _attempt in (0, 1):
             try:
                 got = lark_download_attachments(LARK_HOSTS[hostname], app_id, app_secret,
@@ -1414,7 +1512,9 @@ if mode == "飞书 Base 直连":
                 fails = st.session_state.get("_lark_failed", [])
                 if got:
                     st.session_state["_payloads"] = got
-                    st.sidebar.success(f"已获取 {len(got)} 个文件")
+                    st.session_state["_ops_checked"] = pd.Timestamp.now()
+                    if not auto:
+                        st.sidebar.success(f"已检查 {len(got)} 个文件，新下载 {st.session_state.get('_lark_new', 0)} 个")
                 else:
                     st.sidebar.error("一个附件都没拿到——多半是 `drive:drive:readonly` 权限没开/没发布")
                 if fails:
@@ -1422,15 +1522,30 @@ if mode == "飞书 Base 直连":
                                        "网络抖动造成的话再点一次『拉取全部』即可，已下好的会走缓存不重下。")
                     with st.sidebar.expander(f"失败清单（{len(fails)}）"):
                         st.text("\n".join(fails))
-                break
+                return bool(got)
             except NetworkError as e:
                 st.sidebar.error(f"🌐 {e}\n\n网络问题，再点一次即可（已下好的文件有缓存）。")
-                break
+                return False
             except Exception as e:                              # noqa: BLE001
                 if _attempt == 0 and "access token" in str(e).lower():
                     lark_token.clear()
                     continue
                 st.sidebar.error(f"🔑 {e}")
+                return False
+        return False
+
+    if st.sidebar.button("② 🔄 从 Base 拉取（只补新增）", type="primary",
+                         help="检查 Base 里的附件：已经下载、识别过的直接用，只下载和识别新增的。"):
+        _pull_ops()
+    elif (not st.session_state.get("_payloads") and not st.session_state.get("_ops_auto_tried")
+          and app_id and app_secret and base_url):
+        # 打开页面自动跑一次：读已识别的结果 + 只补 Base 里新增的文件
+        st.session_state["_ops_auto_tried"] = True
+        if not _pull_ops(auto=True):
+            _local = gather_from_folder(cache_dir) if os.path.isdir(cache_dir) else []
+            if _local:
+                st.session_state["_payloads"] = _local
+                st.sidebar.info(f"连不上飞书，先用本地已下载的 {len(_local)} 个文件（可能缺最新几天）。")
     if os.path.isdir(st.session_state.get("_cache_dir", DEFAULT_CACHE)) and \
             not st.session_state.get("_payloads"):
         if st.sidebar.button("📂 直接用本地缓存（离线）"):
@@ -1480,33 +1595,50 @@ with st.sidebar.expander("达人组数据连接", expanded=not bool(st.session_s
             st.success("已保存")
         except Exception as e:                                # noqa: BLE001
             st.error(f"保存失败：{e}")
-    if crc2.button("🔄 拉取达人组数据", key="cr_pull", type="primary"):
+    def _pull_creator(force: bool) -> bool:
+        """达人组数据：每个附件识别一次就存结果，之后只下载、识别新增的；force = 不用 30 分钟内的检查结果。"""
+        for _attempt in (0, 1):
+            try:
+                secs, cells, failed, cst = lark_creator_fetch_all(LARK_HOSTS[_cr_host_name], _cr_id, _cr_secret,
+                                                                   cr_url, cr_cache)
+                st.session_state["_creator_data"] = secs
+                st.session_state["_creator_ver"] = pd.Timestamp.now().value     # 新数据 → 页面结构要重算
+                st.session_state["_creator_rows"] = {k: len(v) for k, v in secs.items()}
+                st.session_state["_cr_stats"] = {"cells": len(cells), "ok": len(cells) - len(failed), **cst}
+                if force:
+                    st.success(f"✅ 扫到 {len(cells)} 个附件，新识别 {cst['new']} 个，其余直接用已识别结果")
+                if failed:
+                    st.warning(f"⚠️ {len(failed)} 个下载/解析失败（其余照常用）")
+                    with st.expander("失败清单"):
+                        st.text("\n".join(failed))
+                return True
+            except NetworkError as e:
+                st.error(f"🌐 {e}")
+                return False
+            except Exception as e:                              # noqa: BLE001
+                if _attempt == 0 and "access token" in str(e).lower():
+                    lark_token.clear()
+                    continue
+                st.error(f"🔑 {e}")
+                return False
+        return False
+
+    if crc2.button("🔄 拉取（只补新增）", key="cr_pull", type="primary",
+                   help="重新检查达人组文档：识别过的附件直接用，只下载和识别新增的。"):
         if not _cr_id or not _cr_secret:
             st.error("没有可用的 App ID / Secret——去上面「飞书 Base 直连」填一份，或在这里单独填。")
         else:
-            for _attempt in (0, 1):
-                try:
-                    secs, cells, failed = lark_creator_fetch_all(LARK_HOSTS[_cr_host_name], _cr_id, _cr_secret,
-                                                                  cr_url, cr_cache)
-                    st.session_state["_creator_data"] = secs
-                    shp = "、".join(f"{n}（{d.shape[0]:,}行）" for n, d in secs.items())
-                    st.success(f"✅ 扫到 {len(cells)} 个附件，成功 {len(cells)-len(failed)} 个：{shp}")
-                    if failed:
-                        st.warning(f"⚠️ {len(failed)} 个下载/解析失败（其余照常用）")
-                        with st.expander("失败清单"):
-                            st.text("\n".join(failed))
-                    break
-                except NetworkError as e:
-                    st.error(f"🌐 {e}")
-                    break
-                except Exception as e:                              # noqa: BLE001
-                    if _attempt == 0 and "access token" in str(e).lower():
-                        lark_token.clear()
-                        continue
-                    st.error(f"🔑 {e}")
+            _pull_creator(force=True)
+    elif (not st.session_state.get("_creator_data") and not st.session_state.get("_cr_auto_tried")
+          and _cr_id and _cr_secret and cr_url):
+        st.session_state["_cr_auto_tried"] = True          # 打开页面自动检查一次（增量）
+        _pull_creator(force=False)
 if st.session_state.get("_creator_data"):
-    st.sidebar.caption("达人组数据：已载入 " +
-                       "、".join(f"{n}{len(d):,}行" for n, d in st.session_state["_creator_data"].items()))
+    _cs = st.session_state.get("_cr_stats")
+    _rows = st.session_state.get("_creator_rows") or {n: len(d) for n, d in st.session_state["_creator_data"].items()}
+    st.sidebar.caption("达人组数据：已载入 " + "、".join(f"{n}{v:,}行" for n, v in _rows.items())
+                       + (f"。共 {_cs['cells']} 个附件，{_cs['checked']:%m-%d %H:%M} 检查时新识别 {_cs['new']} 个，"
+                          f"其余直接用已识别结果" if _cs else ""))
 
 # 达人组数据的真实列名（2026-09-21 用真实文件核对过，不是猜的）。
 # 结构跟运营数据完全不同：这里的表头在第 0 行、第 1 行是英文说明（已在读取时跳过）。
@@ -1929,6 +2061,9 @@ def build_creator_base(cd: dict) -> dict:
             "赞": _f(L["Likes"]).values, "评": _f(L["Comments"]).values, "转": _f(L["Shares"]).values,
             "完播率%": np.nan, "发布时间": L["LIVE start time"].astype(str).values}))
     out["content"] = pd.concat(cont, ignore_index=True) if cont else pd.DataFrame()
+    for c in ("标题", "发布时间", "挂车链接"):          # 同一条内容每天一行，这些文字重复几十次 → 分类存储（只显示、不当 groupby 键）
+        if c in out["content"]:
+            out["content"][c] = out["content"][c].astype("category")
 
     # ⑦ 全量逐日表：三张原始表（达人/视频/直播）的每一个数值字段按天汇总（链接表的字段在 link 里已有，只补去重数）
     dt = []
@@ -1944,7 +2079,9 @@ def build_creator_base(cd: dict) -> dict:
     out["daytot"] = pd.concat(dt, axis=1).fillna(0.0).rename_axis("日期").reset_index() if dt \
         else pd.DataFrame(columns=["日期"])
     # ⑧ 原始逐日表 + 他们另外上传的「月数据」Excel（逐日 / 逐周 / 逐月 / 自选区间对比页用）
-    out["raw"] = {k: T for k, T in (("Creators", C), ("Products", P), ("Videos", V), ("LIVE", L)) if len(T)}
+    # 「多粒度对比」用的原始字段表：只按日期汇总数值 + 数去重个数，标题 / 发布时间这类长文本用不到，不留在内存里
+    out["raw"] = {k: T.drop(columns=[c for c in _CR_CAT_COLS if c in T.columns])
+                  for k, T in (("Creators", C), ("Products", P), ("Videos", V), ("LIVE", L)) if len(T)}
     out["raw_monthly"] = {k: cd[k][cd[k]["_gran"] == "monthly"].copy() for k in cd
                           if (cd[k]["_gran"] == "monthly").any()}
     return out
@@ -2081,12 +2218,16 @@ def _creator_base() -> dict | None:
     cd = st.session_state.get("_creator_data")
     if not cd:
         return None
+    ver = st.session_state.setdefault("_creator_ver", id(cd))
     memo = st.session_state.get("_cr_base_memo")
-    if memo and memo[0] is cd:
+    if memo and memo[0] == ver:
         return memo[1]
     with st.spinner("整理达人组数据（链接 / 达人 / 视频 / 直播）…"):
         base = build_creator_base(cd)
-    st.session_state["_cr_base_memo"] = (cd, base)
+    st.session_state["_cr_base_memo"] = (ver, base)
+    # 原始四张表整理完就用不到了（页面只读整理后的结构），换成空表，省下一整份内存
+    st.session_state.setdefault("_creator_rows", {k: len(v) for k, v in cd.items()})
+    st.session_state["_creator_data"] = {k: v.iloc[:0] for k, v in cd.items()}
     return base
 
 
@@ -2104,8 +2245,16 @@ has_creator = bool(st.session_state.get("_creator_data"))
 df = catalog = pd.DataFrame()
 log: list[str] = []
 
+ops_stats: dict = {}
 if payloads:
-    df, catalog, log = load_files(payloads)
+    # 这次要新识别几个：只在「这批文件」第一次出现时数一次（load_files 有跨会话缓存，它自己的计数可能是别人那次的）
+    _memo = st.session_state.get("_ops_new_memo")
+    if not _memo or _memo[0] != id(payloads):
+        _pd = _parse_dir()
+        _n_new = sum(not os.path.exists(os.path.join(_pd, hashlib.sha1(raw).hexdigest()[:24] + ".json"))
+                     for _n, raw in payloads)
+        st.session_state["_ops_new_memo"] = (id(payloads), _n_new, pd.Timestamp.now())
+    df, catalog, log, ops_stats = load_files(payloads)
     if df.empty:
         st.title("NailVesta 链接数据深度分析")
         st.error("没有解析到有效数据。请检查文件格式。")
@@ -2143,6 +2292,12 @@ dmin, dmax = df["日期"].min(), df["日期"].max()
 st.sidebar.markdown("---")
 st.sidebar.success(f"{PROF['name']}数据：{df['日期'].nunique()} 天 · {df['product_id'].nunique()} 个链接")
 st.sidebar.caption(f"{dmin.date()} → {dmax.date()}")
+if SRC == "运营" and st.session_state.get("_ops_new_memo"):
+    _m = st.session_state["_ops_new_memo"]
+    _dl = st.session_state.get("_lark_new")
+    st.sidebar.caption(f"运营日报 {len(payloads)} 个文件：{_m[2]:%m-%d %H:%M} 载入时"
+                       + (f"新下载 {_dl} 个、" if _dl is not None else "")
+                       + f"新识别 {_m[1]} 个，其余 {len(payloads) - _m[1]} 个直接用已识别结果。")
 
 df_all = df          # 「两段对比」用全量数据，不受下面的分析区间限制
 rng = st.sidebar.date_input(f"分析区间（{PROF['name']}）", value=(dmin.date(), dmax.date()),
