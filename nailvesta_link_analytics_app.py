@@ -267,6 +267,28 @@ def _read_one(buf, fname: str):
     return d, out, catalog
 
 
+def _tmp_path(path: str) -> str:
+    """每次写都用自己独有的临时文件名：同一时间可能有好几个会话（刷新页面 / 开了两个标签页时，旧会话还在服务器上跑）
+    在下载、识别同一个文件，共用一个 .part 会互相覆盖、改名时找不到文件。"""
+    import threading
+    import uuid
+    return f"{path}.{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}.part"
+
+
+def _atomic_write(path: str, write) -> None:
+    """write(tmp) 写到临时文件，写完再一次性改名成正式文件：别的会话永远读不到写了一半的文件。"""
+    tmp = _tmp_path(path)
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 PARSE_VER = "ops-v1"          # 改了 _read_one 的识别逻辑就把这个版本号 +1，旧的识别结果会自动作废、重新识别
 
 
@@ -297,10 +319,13 @@ def _read_one_cached(raw: bytes, name: str):
     try:
         os.makedirs(pdir, exist_ok=True)
         if df is not None:
-            df.to_parquet(data_p, index=False)
-        with open(meta_p, "w", encoding="utf-8") as fh:
-            json.dump({"name": name, "skip": df is None, "date": str(d.date()) if d is not None else None,
-                       "catalog": cat}, fh, ensure_ascii=False, default=str)
+            _atomic_write(data_p, lambda tmp: df.to_parquet(tmp, index=False))
+        meta = {"name": name, "skip": df is None, "date": str(d.date()) if d is not None else None, "catalog": cat}
+
+        def _wm(tmp):
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, ensure_ascii=False, default=str)
+        _atomic_write(meta_p, _wm)                  # 结果表先写好、说明文件后写：有说明文件就一定有结果表
     except Exception:                               # noqa: BLE001  写不了缓存不影响这次结果
         pass
     return d, df, cat, True
@@ -412,23 +437,29 @@ def _lark_api(host, path, token=None, method="GET", retries: int = 4, **kw):
 
 
 def _lark_fetch_media(host, token, ftok, local, min_size: int = 500):
-    """下载一个附件到 local（先写 .part 再改名，下载一半断掉不会留下坏文件）。成功返回 None，失败返回原因。
+    """下载一个附件到 local。成功返回 None，失败返回原因（任何错误都只算这一个文件失败，不影响其它文件）。
     在线程里跑，不能碰 st.*。"""
     try:
+        if os.path.exists(local) and os.path.getsize(local) > min_size:
+            return None                                     # 别的会话刚刚已经下好了
         r = _lark_api(host, f"/drive/v1/medias/{ftok}/download", token=token)
         if r.status_code == 200 and len(r.content) > min_size:
-            tmp = local + ".part"
-            with open(tmp, "wb") as fh:
-                fh.write(r.content)
-            os.replace(tmp, local)
+            data = r.content
+
+            def _w(tmp):
+                with open(tmp, "wb") as fh:
+                    fh.write(data)
+            _atomic_write(local, _w)
             return None
         try:
             j = r.json()
             return f"{j.get('code')} {j.get('msg')}"
         except Exception:                                   # noqa: BLE001
             return f"HTTP {r.status_code}"
-    except NetworkError as e:
-        return str(e)
+    except Exception as e:                                  # noqa: BLE001
+        if os.path.exists(local) and os.path.getsize(local) > min_size:
+            return None                                     # 撞车了但文件已经在了，算成功
+        return f"{type(e).__name__}: {e}"
 
 
 def _lark_fetch_many(host, token, jobs, label: str, min_size: int = 500, workers: int = 6) -> dict:
@@ -436,6 +467,7 @@ def _lark_fetch_many(host, token, jobs, label: str, min_size: int = 500, workers
     返回 {显示名: 失败原因}。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     fails: dict = {}
+    jobs = list({lp: (nm, ft, lp) for nm, ft, lp in jobs}.values())          # 同一个本地文件只下一次
     if not jobs:
         return fails
     prog = st.progress(0.0, text=f"{label}… 0/{len(jobs)}")
@@ -718,7 +750,7 @@ def lark_creator_fetch_all(host, app_id, app_secret, url, cache_dir):
             raw.insert(2, "_month", _MONTH_NUM.get(c["month"]))
             raw.insert(3, "_src_file", c["name"])
             try:
-                raw.to_parquet(parsed_cache, index=False)          # 缓存解析结果，下次同一个附件不用再读 xlsx
+                _atomic_write(parsed_cache, lambda tmp, _r=raw: _r.to_parquet(tmp, index=False))  # 缓存识别结果
             except Exception:                                       # noqa: BLE001
                 pass                                                # 写缓存失败不影响本次结果，就是下次会重读一遍
             frames[c["section"]].append(raw)
@@ -1619,7 +1651,7 @@ with st.sidebar.expander("达人组数据连接", expanded=not bool(st.session_s
                 if _attempt == 0 and "access token" in str(e).lower():
                     lark_token.clear()
                     continue
-                st.error(f"🔑 {e}")
+                st.error(f"⚠️ 载入达人组数据出错：{e}\n\n已经下好的文件都保留着，再点一次「拉取（只补新增）」会接着下。")
                 return False
         return False
 
